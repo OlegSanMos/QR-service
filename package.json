@@ -1,0 +1,27 @@
+{
+  "name": "qr-air-transfer",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview --host",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:e2e": "playwright test"
+  },
+  "dependencies": {
+    "zxing-wasm": "3.1.4"
+  },
+  "devDependencies": {
+    "vite": "8.3.1",
+    "vitest": "5.0.2",
+    "typescript": "5.9.3",
+    "@playwright/test": "1.56.1",
+    "@types/node": "22.19.1"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
