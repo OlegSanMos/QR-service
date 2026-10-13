@@ -57,6 +57,26 @@ npm run test:e2e   # тесты в Chromium с фейковой камерой (
 публиковать приложение на GitHub Pages. Подойдёт и любой статический хостинг —
 все пути относительные.
 
+### Если `npm install` падает с ошибкой сертификата
+
+`UNABLE_TO_GET_ISSUER_CERT_LOCALLY` / `SELF_SIGNED_CERT_IN_CHAIN` означает, что
+npm-репозиторий или прокси в корпоративной сети подписан сертификатом, которому
+Node.js не доверяет. На macOS можно передать Node все сертификаты, которым
+доверяет система:
+
+```bash
+security find-certificate -a -p \
+  /System/Library/Keychains/SystemRootCertificates.keychain \
+  /Library/Keychains/System.keychain \
+  ~/Library/Keychains/login.keychain-db > ~/macos-ca-bundle.pem
+export NODE_EXTRA_CA_CERTS=~/macos-ca-bundle.pem   # добавьте в ~/.zshrc, чтобы не повторять
+npm install
+```
+
+Собранному приложению npm не нужен: папку `dist/` (результат `npm run build`)
+можно раздать любым статическим сервером, например `python3 -m http.server 8080`
+внутри неё, и открыть `http://localhost:8080`.
+
 Чтобы пользоваться совсем без сети, откройте приложение один раз (сервис-воркер
 закэширует всё, включая WebAssembly-распознаватель) и добавьте его на главный
 экран.
