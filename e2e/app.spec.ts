@@ -51,10 +51,23 @@ test('sender screen produces a decodable QR stream that reassembles into the fil
   await expect(page.locator('.stage')).toHaveCount(0);
 });
 
+function stat(page: import('@playwright/test').Page, key: string) {
+  return page.locator('.stat', { has: page.locator('.k', { hasText: key }) }).locator('.v');
+}
+
 test('receiver decodes the fake camera stream and offers the file', async ({ page }) => {
   await page.goto('/#/receive');
   await page.getByRole('button', { name: /Включить камеру/ }).click();
-  await expect(page.getByText('✅')).toBeVisible({ timeout: 60_000 });
+  // The camera is opened in its 60 fps mode and, once a code is seen, only the area around it is decoded.
+  await expect(page.getByText(/@ 60 к\/с/)).toBeVisible();
+  await expect(stat(page, 'Область')).toContainText('слежение', { timeout: 30_000 });
+  let bestCameraFps = 0;
+  while (!(await page.getByText('✅').isVisible())) {
+    const fps = Number.parseInt((await stat(page, 'Камера').textContent()) ?? '0', 10);
+    bestCameraFps = Math.max(bestCameraFps, fps);
+    await page.waitForTimeout(250);
+  }
+  expect(bestCameraFps).toBeGreaterThanOrEqual(45);
   await expect(page.getByRole('heading', { name: 'e2e.txt' })).toBeVisible();
   await expect(page.getByText(/CRC-32 ✔/)).toBeVisible();
   const [download] = await Promise.all([page.waitForEvent('download'), page.getByRole('link', { name: /Сохранить/ }).click()]);

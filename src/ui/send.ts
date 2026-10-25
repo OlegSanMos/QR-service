@@ -19,8 +19,9 @@ interface SendSettings {
 const PRESETS: { label: string; hint: string; s: Omit<SendSettings, 'compress'> }[] = [
   { label: 'Надёжно', hint: 'старые телефоны, плохой свет', s: { version: 14, ecc: 'M', fps: 7.5, codes: 1 } },
   { label: 'Баланс', hint: 'большинство телефонов', s: { version: 22, ecc: 'L', fps: 12, codes: 1 } },
-  { label: 'Быстро', hint: 'современный телефон, штатив', s: { version: 30, ecc: 'L', fps: 15, codes: 1 } },
-  { label: 'Максимум', hint: 'планшет/ноутбук → камера 60 к/с', s: { version: 40, ecc: 'L', fps: 20, codes: 2 } },
+  { label: 'Быстро', hint: 'камера 30 к/с, телефон на подставке', s: { version: 30, ecc: 'L', fps: 15, codes: 1 } },
+  { label: '60 к/с', hint: 'камера получателя 60 к/с (выберите в настройках приёма)', s: { version: 25, ecc: 'L', fps: 30, codes: 1 } },
+  { label: 'Максимум', hint: 'экран ноутбука → камера 60 к/с, подставка', s: { version: 30, ecc: 'L', fps: 30, codes: 2 } },
 ];
 
 const STORAGE_KEY = 'qr-air.send-settings';
@@ -160,7 +161,8 @@ export function renderSend(root: HTMLElement): () => void {
     const raw = block * settings.fps * settings.codes;
     summary.append(stat('Данных в коде', `${block} Б`), stat('Поток (отправка)', formatRate(raw)));
     const real = estimateThroughput(settings.version, settings.ecc, settings.codes, { ...DEFAULT_CHANNEL, displayFps: settings.fps });
-    summary.append(stat('Приём, камера 30 к/с*', formatRate(real.bytesPerSecond)));
+    const real60 = estimateThroughput(settings.version, settings.ecc, settings.codes, { ...DEFAULT_CHANNEL, displayFps: settings.fps, cameraFps: 60, shutterMs: 10 });
+    summary.append(stat('Приём, камера 30 к/с*', formatRate(real.bytesPerSecond)), stat('Приём, камера 60 к/с*', formatRate(real60.bytesPerSecond)));
     if (payload) {
       // Size before compression plus ~64 B of container metadata: an upper bound.
       const K = blockCount(payload.data.length + 64, block);
@@ -215,7 +217,7 @@ export function renderSend(root: HTMLElement): () => void {
       h('div', { class: 'row', style: 'margin:12px 0' }, h('span', { class: 'grow small' }, 'Кодов на экране'), codesSeg),
       h('label', { class: 'check small' }, compressBox, h('span', null, 'Сжимать (deflate), если это уменьшает размер')),
       summary,
-      h('div', { class: 'muted small', style: 'margin-top:8px' }, '* оценка по модели канала: камера 30 к/с, экран 60 Гц. Подробнее — в разделе «Лимиты».'),
+      h('div', { class: 'muted small', style: 'margin-top:8px' }, '* оценка по модели канала, экран 60 Гц. Подробнее — в разделе «Лимиты».'),
       warn,
     ),
     startBtn,

@@ -40,6 +40,7 @@ self.onmessage = async (e: MessageEvent<DecodeRequest>) => {
       quads.push({
         valid: r.isValid,
         points: [p.topLeft.x, p.topLeft.y, p.topRight.x, p.topRight.y, p.bottomRight.x, p.bottomRight.y, p.bottomLeft.x, p.bottomLeft.y],
+        version: Number.parseInt(r.version, 10) || 0,
       });
     }
     post({ type: 'result', id, codes, quads, ms: performance.now() - t0 });
