@@ -32,6 +32,8 @@ export interface DetectedQuad {
   valid: boolean;
   /** x0,y0,x1,y1,x2,y2,x3,y3 in image coordinates. */
   points: number[];
+  /** QR version (1-40), 0 if unknown. */
+  version: number;
 }
 
 export type DecodeResponse =

@@ -1,14 +1,16 @@
 // Renders a QR transfer into a raw YUV4MPEG2 clip for Chromium's fake camera.
-// Each code is held for 2 camera frames (≈ 15 codes/s at 30 fps) and every 5th
-// code is skipped to exercise fountain recovery.
+// The clip runs at 60 fps with each code held for 2 frames (30 codes/s, like a
+// sender at 30 changes/s filmed by a 60 fps phone camera); every 5th code is
+// skipped to exercise fountain recovery.
 
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { packContainer } from '../src/core/container';
 import { TransferEncoder } from '../src/core/transfer';
 import { CACHE_DIR, FAKE_CAMERA_SOURCE, FAKE_CAMERA_VIDEO } from './paths';
 
-const W = 480;
-const H = 360;
+const W = 960;
+const H = 540;
+export const FAKE_CAMERA_FPS = 60;
 
 export default async function globalSetup(): Promise<void> {
   mkdirSync(CACHE_DIR, { recursive: true });
@@ -17,9 +19,9 @@ export default async function globalSetup(): Promise<void> {
   writeFileSync(FAKE_CAMERA_SOURCE, text);
   // No compression: keeps the clip long enough to need several generations' worth of frames.
   const packed = await packContainer({ name: 'e2e.txt', mime: 'text/plain', data: new TextEncoder().encode(text) }, { compress: false });
-  const enc = new TransferEncoder(packed.stream, { version: 10, ecc: 'M' }, 0x00e2e000);
+  const enc = new TransferEncoder(packed.stream, { version: 20, ecc: 'M' }, 0x00e2e000);
   const symbols = enc.K * 2 + 10;
-  const header = Buffer.from(`YUV4MPEG2 W${W} H${H} F30:1 Ip A1:1 C420jpeg\n`, 'ascii');
+  const header = Buffer.from(`YUV4MPEG2 W${W} H${H} F${FAKE_CAMERA_FPS}:1 Ip A1:1 C420jpeg\n`, 'ascii');
   const ySize = W * H;
   const cSize = (W / 2) * (H / 2);
   const chunks: Buffer[] = [header];
