@@ -4,9 +4,10 @@
 // skipped to exercise fountain recovery.
 
 import { mkdirSync, writeFileSync } from 'node:fs';
-import { packContainer } from '../src/core/container';
+import { packFiles } from '../src/core/container';
 import { TransferEncoder } from '../src/core/transfer';
-import { CACHE_DIR, FAKE_CAMERA_SOURCE, FAKE_CAMERA_VIDEO } from './paths';
+import { Prng } from '../src/core/prng';
+import { CACHE_DIR, FAKE_CAMERA_SOURCE, FAKE_CAMERA_SOURCE_BIN, FAKE_CAMERA_SOURCE_CSV, FAKE_CAMERA_VIDEO } from './paths';
 
 const W = 960;
 const H = 540;
@@ -17,8 +18,20 @@ export default async function globalSetup(): Promise<void> {
   const lines = Array.from({ length: 120 }, (_, i) => `${i + 1}. Файл передан по воздуху через поток QR-кодов — ${(i * 7919) % 10007}`);
   const text = lines.join('\n');
   writeFileSync(FAKE_CAMERA_SOURCE, text);
-  // No compression: keeps the clip long enough to need several generations' worth of frames.
-  const packed = await packContainer({ name: 'e2e.txt', mime: 'text/plain', data: new TextEncoder().encode(text) }, { compress: false });
+  const csv = ['id,city,amount', ...Array.from({ length: 400 }, (_, i) => `${i},${['Москва', 'Казань', 'Самара'][i % 3]},${(i * 7919) % 10007}`)].join('\n');
+  writeFileSync(FAKE_CAMERA_SOURCE_CSV, csv);
+  const rng = new Prng(5);
+  const bin = new Uint8Array(24_000).map(() => rng.nextU32() & 255);
+  writeFileSync(FAKE_CAMERA_SOURCE_BIN, bin);
+  // Three files, context-mixing compressed: the browser must run the CM decoder and offer a ZIP.
+  const packed = await packFiles(
+    [
+      { name: 'e2e.txt', mime: 'text/plain', data: new TextEncoder().encode(text) },
+      { name: 'data/table.csv', mime: 'text/csv', data: new TextEncoder().encode(csv) },
+      { name: 'data/random.bin', mime: 'application/octet-stream', data: bin },
+    ],
+    { method: 'cm' },
+  );
   const enc = new TransferEncoder(packed.stream, { version: 20, ecc: 'M' }, 0x00e2e000);
   const symbols = enc.K * 2 + 10;
   const header = Buffer.from(`YUV4MPEG2 W${W} H${H} F${FAKE_CAMERA_FPS}:1 Ip A1:1 C420jpeg\n`, 'ascii');

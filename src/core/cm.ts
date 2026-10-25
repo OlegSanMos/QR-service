@@ -357,7 +357,8 @@ class Predictor {
   }
 }
 
-export type ProgressCallback = (done: number, total: number) => void;
+/** `written` (compressor only): compressed bytes produced so far. */
+export type ProgressCallback = (done: number, total: number, written: number) => void;
 
 const PROGRESS_STEP = 1 << 16;
 
@@ -392,14 +393,14 @@ export function cmCompress(data: Uint8Array, onProgress?: ProgressCallback): Uin
         x2 = ((x2 << 8) | 255) >>> 0;
       }
     }
-    if (onProgress && (i & (PROGRESS_STEP - 1)) === PROGRESS_STEP - 1) onProgress(i + 1, n);
+    if (onProgress && (i & (PROGRESS_STEP - 1)) === PROGRESS_STEP - 1) onProgress(i + 1, n, o);
   }
   // Flush enough bytes that the decoder never reads past the end.
   put(x1 >>> 24);
   put((x1 >>> 16) & 255);
   put((x1 >>> 8) & 255);
   put(x1 & 255);
-  onProgress?.(n, n);
+  onProgress?.(n, n, o);
   return out.slice(0, o);
 }
 
@@ -425,8 +426,8 @@ export function cmDecompress(comp: Uint8Array, length: number, onProgress?: Prog
         x = ((x << 8) | next()) >>> 0;
       }
     }
-    if (onProgress && (i & (PROGRESS_STEP - 1)) === PROGRESS_STEP - 1) onProgress(i + 1, length);
+    if (onProgress && (i & (PROGRESS_STEP - 1)) === PROGRESS_STEP - 1) onProgress(i + 1, length, ip);
   }
-  onProgress?.(length, length);
+  onProgress?.(length, length, ip);
   return out;
 }

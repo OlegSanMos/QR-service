@@ -5,3 +5,7 @@ export const CACHE_DIR = fileURLToPath(new URL('./.cache/', import.meta.url));
 export const FAKE_CAMERA_VIDEO = `${CACHE_DIR}qr-stream.y4m`;
 /** The file encoded into that clip. */
 export const FAKE_CAMERA_SOURCE = `${CACHE_DIR}source.txt`;
+/** Second file of the archive in that clip. */
+export const FAKE_CAMERA_SOURCE_CSV = `${CACHE_DIR}table.csv`;
+/** Incompressible third file of that archive (keeps the transfer a few seconds long). */
+export const FAKE_CAMERA_SOURCE_BIN = `${CACHE_DIR}random.bin`;
