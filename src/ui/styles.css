@@ -517,3 +517,36 @@ code {
   white-space: pre;
   font-size: 0.86rem;
 }
+
+details.advanced {
+  margin-top: 12px;
+  border-top: 1px solid var(--border);
+  padding-top: 8px;
+}
+
+details.advanced > summary {
+  cursor: pointer;
+  color: var(--muted);
+  font-size: 0.92rem;
+  padding: 6px 0;
+}
+
+.file-list {
+  margin-top: 8px;
+  font-size: 0.88rem;
+  max-height: 240px;
+  overflow: auto;
+  text-align: left;
+  word-break: break-all;
+}
+
+.file-list .row {
+  padding: 4px 0;
+  border-bottom: 1px solid var(--border);
+  flex-wrap: nowrap;
+}
+
+.file-list .button {
+  min-height: 34px;
+  padding: 4px 10px;
+}

@@ -1,31 +1,39 @@
-import { packContainer } from '../core/container';
+import { describeFiles, type FileEntry, type Method } from '../core/container';
 import { blockCount } from '../core/fountain/layout';
-import { DEFAULT_CHANNEL, estimateThroughput } from '../core/limits';
+import { autoDisplayFps, DEFAULT_CHANNEL, expectedLinkBytesPerSecond, snapRefreshHz, worstPhaseCapture } from '../core/limits';
 import { MAX_VERSION, type Ecc } from '../core/qr/tables';
-import { blockSizeFor, randomTransferId } from '../core/transfer';
+import { saveSendPosition, sendStartId } from '../core/resume-store';
+import { blockSizeFor } from '../core/transfer';
 import type { EncodeRequest, EncodeResponse, RenderedFrame } from '../workers/messages';
+import { packInWorker, type CodecProgress } from './codec';
 import { ScreenWakeLock, clear, formatBytes, formatDuration, formatRate, h } from './dom';
 
 type CodesPerScreen = 1 | 2 | 4;
+type CompressionChoice = Method | 'auto';
 
 interface SendSettings {
+  /** 'auto', a preset id, or 'manual' after the user touched a control. */
+  preset: string;
   version: number;
   ecc: Ecc;
   fps: number;
   codes: CodesPerScreen;
-  compress: boolean;
+  method: CompressionChoice;
 }
 
-const PRESETS: { label: string; hint: string; s: Omit<SendSettings, 'compress'> }[] = [
-  { label: 'Надёжно', hint: 'старые телефоны, плохой свет', s: { version: 14, ecc: 'M', fps: 7.5, codes: 1 } },
-  { label: 'Баланс', hint: 'большинство телефонов', s: { version: 22, ecc: 'L', fps: 12, codes: 1 } },
-  { label: 'Быстро', hint: 'камера 30 к/с, телефон на подставке', s: { version: 30, ecc: 'L', fps: 15, codes: 1 } },
-  { label: '60 к/с', hint: 'камера получателя 60 к/с (выберите в настройках приёма)', s: { version: 25, ecc: 'L', fps: 30, codes: 1 } },
-  { label: 'Максимум', hint: 'экран ноутбука → камера 60 к/с, подставка', s: { version: 30, ecc: 'L', fps: 30, codes: 2 } },
+/** Version used by the automatic mode: robust at 720p and 1080p, 1258 bytes per code. */
+const AUTO_VERSION = 25;
+
+const PRESETS: { id: string; label: string; hint: string; s?: Omit<SendSettings, 'preset' | 'method'> }[] = [
+  { id: 'auto', label: '⚡ Авто', hint: 'самый быстрый режим для любой камеры получателя: подстраивается под экран, на экране ноутбука или планшета показывает 2 кода друг над другом' },
+  { id: 'reliable', label: 'Надёжно', hint: 'старые телефоны, плохой свет', s: { version: 14, ecc: 'M', fps: 7.5, codes: 1 } },
+  { id: 'cam30', label: '30 к/с', hint: 'камера получателя снимает 30 к/с', s: { version: 25, ecc: 'L', fps: 15, codes: 1 } },
+  { id: 'cam60', label: '60 к/с', hint: 'камера получателя 60 к/с (по умолчанию на приёме)', s: { version: 25, ecc: 'L', fps: 20, codes: 1 } },
+  { id: 'max', label: 'Максимум', hint: 'экран ноутбука → камера 60 к/с, подставка', s: { version: 30, ecc: 'L', fps: 20, codes: 2 } },
 ];
 
-const STORAGE_KEY = 'qr-air.send-settings';
-const DEFAULTS: SendSettings = { ...PRESETS[1].s, compress: true };
+const STORAGE_KEY = 'qr-air.send-settings.v2';
+const DEFAULTS: SendSettings = { preset: 'auto', version: AUTO_VERSION, ecc: 'L', fps: 20, codes: 1, method: 'auto' };
 
 function loadSettings(): SendSettings {
   try {
@@ -45,37 +53,155 @@ function saveSettings(s: SendSettings): void {
   }
 }
 
-interface Payload {
-  name: string;
-  mime: string;
-  data: Uint8Array;
+const METHODS_KEY = 'qr-send-methods';
+const METHODS_KEPT = 32;
+
+/** Compression methods 'auto' chose for recent contents (see PackResult.key), oldest first. */
+function loadMethods(): Record<string, Method> {
+  try {
+    const raw = localStorage.getItem(METHODS_KEY);
+    if (raw) return JSON.parse(raw) as Record<string, Method>;
+  } catch {
+    // unavailable or corrupt: choose afresh
+  }
+  return {};
+}
+
+function rememberMethod(key: string, method: Method): void {
+  const all = loadMethods();
+  delete all[key];
+  all[key] = method;
+  const keys = Object.keys(all);
+  for (const k of keys.slice(0, Math.max(0, keys.length - METHODS_KEPT))) delete all[k];
+  try {
+    localStorage.setItem(METHODS_KEY, JSON.stringify(all));
+  } catch {
+    // ignore
+  }
+}
+
+function storageOrNull(): Storage | null {
+  try {
+    return localStorage;
+  } catch {
+    return null; // access itself throws where storage is disabled
+  }
+}
+
+/**
+ * Two stacked codes suit a laptop or landscape tablet: each is still large on
+ * screen, and the pair (v25: ~254 modules tall, 125 wide) fills the portrait
+ * frame of a phone camera at ≥ 4 camera px per module even at 720p. On phones
+ * and portrait screens one big code is faster to aim at.
+ */
+function wideScreen(): boolean {
+  const w = Math.max(window.screen?.width ?? 0, window.innerWidth);
+  const hgt = Math.max(window.screen?.height ?? 0, window.innerHeight);
+  return window.innerWidth >= 900 && window.innerWidth > window.innerHeight * 1.2 && w >= 1000 && hgt >= 600;
+}
+
+/** Measures the display refresh rate from requestAnimationFrame intervals. */
+function measureRefreshHz(): Promise<number> {
+  return new Promise((resolve) => {
+    const deltas: number[] = [];
+    let last = 0;
+    const tick = (t: number): void => {
+      if (last) deltas.push(t - last);
+      last = t;
+      if (deltas.length < 30) requestAnimationFrame(tick);
+      else {
+        deltas.sort((a, b) => a - b);
+        resolve(snapRefreshHz(1000 / deltas[deltas.length >> 1]));
+      }
+    };
+    requestAnimationFrame(tick);
+    setTimeout(() => resolve(60), 1500); // background tab: rAF may not run
+  });
+}
+
+const METHOD_LABELS: Record<Method, string> = {
+  store: 'без сжатия',
+  deflate: 'deflate',
+  cm: 'контекстное смешивание',
+};
+
+/** Recursively reads a dropped folder (Chrome, Safari, Firefox: webkitGetAsEntry). */
+async function readEntry(entry: FileSystemEntry, prefix: string, out: { file: File; path: string }[]): Promise<void> {
+  if (entry.isFile) {
+    const file = await new Promise<File>((res, rej) => (entry as FileSystemFileEntry).file(res, rej));
+    out.push({ file, path: prefix + file.name });
+  } else if (entry.isDirectory) {
+    const reader = (entry as FileSystemDirectoryEntry).createReader();
+    for (;;) {
+      const batch = await new Promise<FileSystemEntry[]>((res, rej) => reader.readEntries(res, rej));
+      if (batch.length === 0) break;
+      for (const e of batch) await readEntry(e, `${prefix}${entry.name}/`, out);
+    }
+  }
 }
 
 export function renderSend(root: HTMLElement): () => void {
   const settings = loadSettings();
-  let payload: Payload | null = null;
+  let files: FileEntry[] = [];
+  /** The entry made from the text box (by identity: a picked file may have the same name). */
+  let textEntry: FileEntry | null = null;
   let player: Player | null = null;
+  let refreshHz = 60;
+  /** Compression in progress (aborted by the cancel button or when leaving the page). */
+  let packing: AbortController | null = null;
+  let disposed = false;
+  /** Last packed stream: Stop then Start with the same files sends exactly the same stream. */
+  let packedCache: { files: FileEntry[]; method: SendSettings['method']; stream: Uint8Array; packed: Method } | null = null;
 
   // ---- source selection ----------------------------------------------------
-  const fileInput = h('input', { type: 'file' });
-  const fileLabel = h('div', { class: 'muted small' }, 'или перетащите файл сюда');
-  const drop = h('label', { class: 'drop' }, fileInput, h('div', { style: 'font-size:2rem' }, '📄'), h('div', null, h('b', null, 'Выбрать файл')), fileLabel);
+  const fileInput = h('input', { type: 'file', multiple: true });
+  const folderInput = h('input', { type: 'file', multiple: true });
+  folderInput.setAttribute('webkitdirectory', '');
+  const canPickFolder = 'webkitdirectory' in folderInput && !/iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
+  const drop = h(
+    'label',
+    { class: 'drop' },
+    fileInput,
+    h('div', { style: 'font-size:2rem' }, '📄'),
+    h('div', null, h('b', null, 'Выбрать файлы')),
+    h('div', { class: 'muted small' }, canPickFolder ? 'или перетащите файлы и папки сюда' : 'можно выбрать несколько'),
+  );
+  const folderBtn = h('button', { onclick: () => folderInput.click(), style: canPickFolder ? '' : 'display:none' }, '📁 Выбрать папку');
   const textArea = h('textarea', { placeholder: '…или вставьте текст, ссылку, ключ, заметку' });
   const chosen = h('div', { class: 'small', style: 'margin-top:10px' });
 
-  async function setFile(file: File): Promise<void> {
-    chosen.textContent = `Чтение ${file.name}…`;
-    const data = new Uint8Array(await file.arrayBuffer());
-    payload = { name: file.name, mime: file.type || 'application/octet-stream', data };
-    textArea.value = '';
-    chosen.textContent = `✔ ${file.name} — ${formatBytes(data.length)}`;
+  async function addFiles(list: { file: File; path: string }[]): Promise<void> {
+    if (list.length === 0) return;
+    chosen.textContent = `Чтение ${list.length} файл(ов)…`;
+    const read: FileEntry[] = [];
+    for (const { file, path } of list) {
+      read.push({ name: path, mime: file.type || 'application/octet-stream', data: new Uint8Array(await file.arrayBuffer()) });
+    }
+    files = files.concat(read);
+    renderChosen();
+  }
+
+  function renderChosen(): void {
+    clear(chosen);
+    if (files.length === 0) {
+      updateSummary();
+      return;
+    }
+    const total = files.reduce((s, f) => s + f.data.length, 0);
+    const list = h('div', { class: 'file-list' });
+    for (const f of files.slice(0, 6)) list.appendChild(h('div', null, `• ${f.name} — ${formatBytes(f.data.length)}`));
+    if (files.length > 6) list.appendChild(h('div', { class: 'muted' }, `… и ещё ${files.length - 6}`));
+    chosen.append(
+      h('div', { class: 'row' }, h('b', { class: 'grow' }, `✔ ${describeFiles(files)} · ${formatBytes(total)}`), h('button', { onclick: () => ((files = []), (textEntry = null), (textArea.value = ''), renderChosen()) }, 'Очистить')),
+      list,
+    );
     updateSummary();
   }
 
-  fileInput.addEventListener('change', () => {
-    const f = fileInput.files?.[0];
-    if (f) void setFile(f);
-  });
+  const fromInput = (input: HTMLInputElement): { file: File; path: string }[] =>
+    Array.from(input.files ?? []).map((file) => ({ file, path: (file as File & { webkitRelativePath?: string }).webkitRelativePath || file.name }));
+  fileInput.addEventListener('change', () => void addFiles(fromInput(fileInput)).then(() => (fileInput.value = '')));
+  folderInput.addEventListener('change', () => void addFiles(fromInput(folderInput)).then(() => (folderInput.value = '')));
   drop.addEventListener('dragover', (e) => {
     e.preventDefault();
     drop.classList.add('over');
@@ -84,35 +210,35 @@ export function renderSend(root: HTMLElement): () => void {
   drop.addEventListener('drop', (e) => {
     e.preventDefault();
     drop.classList.remove('over');
-    const f = e.dataTransfer?.files?.[0];
-    if (f) void setFile(f);
+    const items = Array.from(e.dataTransfer?.items ?? []);
+    const entries = items.map((i) => i.webkitGetAsEntry?.()).filter((x): x is FileSystemEntry => !!x);
+    if (entries.length > 0) {
+      const out: { file: File; path: string }[] = [];
+      void Promise.all(entries.map((en) => readEntry(en, '', out))).then(() => addFiles(out));
+    } else {
+      void addFiles(Array.from(e.dataTransfer?.files ?? []).map((file) => ({ file, path: file.name })));
+    }
   });
   textArea.addEventListener('input', () => {
-    if (textArea.value) {
-      payload = { name: 'текст.txt', mime: 'text/plain;charset=utf-8', data: new TextEncoder().encode(textArea.value) };
-      chosen.textContent = `✔ текст — ${formatBytes(payload.data.length)}`;
-      fileInput.value = '';
-    } else {
-      payload = null;
-      chosen.textContent = '';
-    }
-    updateSummary();
+    files = files.filter((f) => f !== textEntry);
+    textEntry = textArea.value ? { name: 'текст.txt', mime: 'text/plain;charset=utf-8', data: new TextEncoder().encode(textArea.value) } : null;
+    if (textEntry) files.push(textEntry);
+    renderChosen();
   });
 
-  // ---- settings --------------------------------------------------------------
+  // ---- mode & settings ---------------------------------------------------------
   const presetSeg = h('div', { class: 'presets' });
   const presetHint = h('div', { class: 'muted small', style: 'margin-top:6px' });
-  PRESETS.forEach((p) => {
-    presetSeg.appendChild(
-      h('button', {
-        onclick: () => {
-          Object.assign(settings, p.s);
-          presetHint.textContent = p.hint;
-          syncControls();
-        },
-      }, p.label),
-    );
-  });
+  const presetButtons = PRESETS.map((p) =>
+    h('button', {
+      onclick: () => {
+        settings.preset = p.id;
+        if (p.s) Object.assign(settings, p.s);
+        syncControls();
+      },
+    }, p.label),
+  );
+  presetButtons.forEach((b) => presetSeg.appendChild(b));
 
   const versionInput = h('input', { type: 'range', min: 5, max: MAX_VERSION, step: 1 });
   const versionOut = h('b');
@@ -120,28 +246,46 @@ export function renderSend(root: HTMLElement): () => void {
   const fpsOut = h('b');
   const eccSeg = h('div', { class: 'seg' });
   const codesSeg = h('div', { class: 'seg' });
-  const compressBox = h('input', { type: 'checkbox' });
+  const methodSelect = h(
+    'select',
+    { style: 'width:auto' },
+    h('option', { value: 'auto' }, 'авто (быстрее всего)'),
+    h('option', { value: 'cm' }, 'максимальное (CM)'),
+    h('option', { value: 'deflate' }, 'быстрое (deflate)'),
+    h('option', { value: 'store' }, 'без сжатия'),
+  );
   const summary = h('div', { class: 'stats', style: 'margin-top:12px' });
   const warn = h('div');
 
-  const eccButtons = (['L', 'M', 'Q', 'H'] as Ecc[]).map((ecc) =>
-    h('button', { onclick: () => ((settings.ecc = ecc), syncControls()) }, ecc),
-  );
+  const manual = (): void => {
+    settings.preset = 'manual';
+  };
+  const eccButtons = (['L', 'M', 'Q', 'H'] as Ecc[]).map((ecc) => h('button', { onclick: () => (manual(), (settings.ecc = ecc), syncControls()) }, ecc));
   eccButtons.forEach((b) => eccSeg.appendChild(b));
-  const codeButtons = ([1, 2, 4] as CodesPerScreen[]).map((n) =>
-    h('button', { onclick: () => ((settings.codes = n), syncControls()) }, String(n)),
-  );
+  const codeButtons = ([1, 2, 4] as CodesPerScreen[]).map((n) => h('button', { onclick: () => (manual(), (settings.codes = n), syncControls()) }, String(n)));
   codeButtons.forEach((b) => codesSeg.appendChild(b));
+  versionInput.addEventListener('input', () => (manual(), (settings.version = Number(versionInput.value)), syncControls()));
+  fpsInput.addEventListener('input', () => (manual(), (settings.fps = Number(fpsInput.value)), syncControls()));
+  methodSelect.addEventListener('change', () => ((settings.method = methodSelect.value as CompressionChoice), syncControls()));
 
-  versionInput.addEventListener('input', () => ((settings.version = Number(versionInput.value)), syncControls()));
-  fpsInput.addEventListener('input', () => ((settings.fps = Number(fpsInput.value)), syncControls()));
-  compressBox.addEventListener('change', () => ((settings.compress = compressBox.checked), syncControls()));
+  /** In automatic mode the parameters follow the measured display. */
+  function applyAuto(): void {
+    if (settings.preset !== 'auto') return;
+    settings.version = AUTO_VERSION;
+    settings.ecc = 'L';
+    settings.codes = wideScreen() ? 2 : 1;
+    settings.fps = Math.round(autoDisplayFps(refreshHz) * 10) / 10;
+  }
 
   function stat(k: string, v: string): HTMLElement {
     return h('div', { class: 'stat' }, h('div', { class: 'k' }, k), h('div', { class: 'v' }, v));
   }
 
   function syncControls(): void {
+    applyAuto();
+    presetButtons.forEach((b, i) => b.classList.toggle('on', PRESETS[i].id === settings.preset));
+    const preset = PRESETS.find((p) => p.id === settings.preset);
+    presetHint.textContent = preset ? preset.hint : 'ручная настройка';
     versionInput.value = String(settings.version);
     const modules = settings.version * 4 + 17;
     versionOut.textContent = `v${settings.version} · ${modules}×${modules}`;
@@ -149,88 +293,162 @@ export function renderSend(root: HTMLElement): () => void {
     fpsOut.textContent = `${settings.fps} кадр/с`;
     eccButtons.forEach((b) => b.classList.toggle('on', b.textContent === settings.ecc));
     codeButtons.forEach((b) => b.classList.toggle('on', b.textContent === String(settings.codes)));
-    compressBox.checked = settings.compress;
+    methodSelect.value = settings.method;
     saveSettings(settings);
     updateSummary();
+  }
+
+  function linkRate(): number {
+    return expectedLinkBytesPerSecond(settings.version, settings.ecc, settings.codes, settings.fps, refreshHz);
   }
 
   function updateSummary(): void {
     clear(summary);
     clear(warn);
     const block = blockSizeFor(settings.version, settings.ecc);
-    const raw = block * settings.fps * settings.codes;
-    summary.append(stat('Данных в коде', `${block} Б`), stat('Поток (отправка)', formatRate(raw)));
-    const real = estimateThroughput(settings.version, settings.ecc, settings.codes, { ...DEFAULT_CHANNEL, displayFps: settings.fps });
-    const real60 = estimateThroughput(settings.version, settings.ecc, settings.codes, { ...DEFAULT_CHANNEL, displayFps: settings.fps, cameraFps: 60, shutterMs: 10 });
-    summary.append(stat('Приём, камера 30 к/с*', formatRate(real.bytesPerSecond)), stat('Приём, камера 60 к/с*', formatRate(real60.bytesPerSecond)));
-    if (payload) {
-      // Size before compression plus ~64 B of container metadata: an upper bound.
-      const K = blockCount(payload.data.length + 64, block);
-      summary.append(stat('Кадров минимум', `${K}`), stat('Время ≥', formatDuration(K / (settings.fps * settings.codes))));
-      const t = K / Math.max(1e-6, real.codesPerSecond);
-      summary.append(stat('Время ≈ (30 к/с)', formatDuration(t)));
-      if (t > 30 * 60) warn.appendChild(h('div', { class: 'note', style: 'margin-top:10px' }, `Передача займёт около ${formatDuration(t)}. Закрепите устройства (штатив/подставка) и отключите автоблокировку экрана.`));
+    const rate = linkRate();
+    summary.append(
+      stat('Режим', `v${settings.version}-${settings.ecc} · ${settings.fps} смен/с${settings.codes > 1 ? ` · ${settings.codes} кода` : ''}`),
+      stat('Ожидаемая скорость*', formatRate(rate)),
+    );
+    if (files.length > 0) {
+      const total = files.reduce((s, f) => s + f.data.length, 0);
+      const K = blockCount(total + 64, block);
+      summary.append(stat('Без сжатия ≈', formatDuration((K * block) / rate)), stat('Со сжатием', 'посчитаем при старте'));
+      const t = (K * block) / rate;
+      if (t > 30 * 60) warn.appendChild(h('div', { class: 'note', style: 'margin-top:10px' }, `Без сжатия передача заняла бы около ${formatDuration(t)}. Закрепите устройства (подставка) и отключите автоблокировку экрана.`));
     }
+    const stallWarning = phaseLockWarning(settings.fps, refreshHz);
+    if (stallWarning) warn.appendChild(h('div', { class: 'note', style: 'margin-top:10px' }, stallWarning));
     if (settings.version >= 33 && settings.codes > 1)
       warn.appendChild(h('div', { class: 'note', style: 'margin-top:10px' }, 'Несколько крупных кодов требуют большого экрана отправителя и камеры 1080p+ у получателя.'));
   }
 
-  const startBtn = h('button', { class: 'primary wide', onclick: () => void start() }, '▶ Начать передачу');
+  const START_LABEL = '▶ Начать передачу';
+  const startBtn = h('button', { class: 'primary wide', onclick: () => (packing ? packing.abort() : void start()) }, START_LABEL);
   const status = h('div', { class: 'small', style: 'margin-top:8px' });
+  const progressBar = h('div');
+  const progressWrap = h('div', { class: 'progress', style: 'display:none' }, progressBar);
 
   async function start(): Promise<void> {
-    if (!payload) {
-      status.textContent = 'Сначала выберите файл или введите текст.';
+    if (files.length === 0) {
+      status.textContent = 'Сначала выберите файлы или введите текст.';
       return;
     }
-    startBtn.disabled = true;
-    status.textContent = settings.compress ? 'Сжатие и подготовка…' : 'Подготовка…';
+    const chosenFiles = files; // the list may change while compressing
+    const method = settings.method;
+    const total = chosenFiles.reduce((s, f) => s + f.data.length, 0);
+    const t0 = performance.now();
+    const onProgress = (p: CodecProgress): void => {
+      const pct = p.total ? (p.done / p.total) * 100 : 0;
+      progressBar.style.width = `${pct.toFixed(0)}%`;
+      status.textContent = p.phase === 'cm' ? `Сжатие (контекстное смешивание): ${pct.toFixed(0)}%` : 'Сжатие…';
+    };
     try {
-      const packed = await packContainer(payload, { compress: settings.compress });
-      status.textContent = packed.compressed
-        ? `Сжато: ${formatBytes(payload.data.length)} → ${formatBytes(packed.stream.length)}`
-        : '';
+      let packed = packedCache && packedCache.files === chosenFiles && packedCache.method === method ? packedCache : null;
+      if (!packed) {
+        packing = new AbortController();
+        startBtn.textContent = '✕ Отменить сжатие';
+        progressWrap.style.display = '';
+        progressBar.style.width = '0';
+        const r = await packInWorker(chosenFiles, { method, linkBytesPerSecond: linkRate(), remembered: loadMethods(), signal: packing.signal }, onProgress);
+        // The same content must give the same stream (and transfer id) after a
+        // reload too, whatever the CPU load: remember what 'auto' chose.
+        if (method === 'auto') rememberMethod(r.key, r.method);
+        packed = packedCache = { files: chosenFiles, method, stream: r.stream, packed: r.method };
+        const secs = (performance.now() - t0) / 1000;
+        const saved = total > 0 ? Math.max(0, 1 - r.stream.length / total) : 0;
+        status.textContent =
+          `${METHOD_LABELS[r.method]}: ${formatBytes(total)} → ${formatBytes(r.stream.length)}` +
+          (saved > 0.005 ? ` (−${Math.round(saved * 100)}%)` : '') +
+          ` за ${formatDuration(secs)} · передача ≈ ${formatDuration(r.stream.length / linkRate())}`;
+      }
+      packing = null;
+      startBtn.textContent = START_LABEL;
+      progressWrap.style.display = 'none';
+      if (disposed) return;
+      startBtn.disabled = true;
       player?.destroy();
-      player = new Player(packed.stream, settings, payload.name, () => {
+      player = new Player(packed.stream, settings, describeFiles(chosenFiles), () => {
         player = null;
         startBtn.disabled = false;
+        if (!disposed) syncControls(); // a screen measured or resized meanwhile
       });
       await player.start();
     } catch (err) {
-      status.textContent = `Ошибка: ${err instanceof Error ? err.message : String(err)}`;
+      packing = null;
+      startBtn.textContent = START_LABEL;
       startBtn.disabled = false;
+      progressWrap.style.display = 'none';
+      const cancelled = err instanceof DOMException && err.name === 'AbortError';
+      status.textContent = cancelled ? 'Сжатие отменено.' : `Ошибка: ${err instanceof Error ? err.message : String(err)}`;
     }
   }
 
   root.append(
     h('header', { class: 'bar' }, h('a', { class: 'back', href: '#/' }, '←'), h('h1', null, 'Отправка')),
-    h('div', { class: 'card' }, h('h3', null, '1. Что передаём'), drop, h('div', { style: 'margin-top:12px' }, textArea), chosen),
+    h('div', { class: 'card' }, h('h3', null, '1. Что передаём'), drop, h('div', { class: 'row', style: 'margin-top:8px' }, folderBtn), h('div', { style: 'margin-top:12px' }, textArea), chosen),
     h(
       'div',
       { class: 'card' },
-      h('h3', null, '2. Параметры'),
+      h('h3', null, '2. Режим'),
       presetSeg,
       presetHint,
-      h('label', { class: 'field' }, h('span', null, 'Версия QR (больше — больше данных, сложнее сканировать)', versionOut), versionInput),
-      h('label', { class: 'field' }, h('span', null, 'Смена кодов в секунду', fpsOut), fpsInput),
-      h('div', { class: 'row', style: 'margin:12px 0' }, h('span', { class: 'grow small' }, 'Коррекция ошибок'), eccSeg),
-      h('div', { class: 'row', style: 'margin:12px 0' }, h('span', { class: 'grow small' }, 'Кодов на экране'), codesSeg),
-      h('label', { class: 'check small' }, compressBox, h('span', null, 'Сжимать (deflate), если это уменьшает размер')),
       summary,
-      h('div', { class: 'muted small', style: 'margin-top:8px' }, '* оценка по модели канала, экран 60 Гц. Подробнее — в разделе «Лимиты».'),
       warn,
+      h(
+        'details',
+        { class: 'advanced' },
+        h('summary', null, 'Ручная настройка'),
+        h('label', { class: 'field' }, h('span', null, 'Версия QR (больше — больше данных, сложнее сканировать)', versionOut), versionInput),
+        h('label', { class: 'field' }, h('span', null, 'Смена кодов в секунду', fpsOut), fpsInput),
+        h('div', { class: 'row', style: 'margin:12px 0' }, h('span', { class: 'grow small' }, 'Коррекция ошибок'), eccSeg),
+        h('div', { class: 'row', style: 'margin:12px 0' }, h('span', { class: 'grow small' }, 'Кодов на экране'), codesSeg),
+        h('div', { class: 'row', style: 'margin:12px 0' }, h('span', { class: 'grow small' }, 'Сжатие'), methodSelect),
+      ),
+      h('div', { class: 'muted small', style: 'margin-top:8px' }, '* оценка по модели канала для камер 30 и 60 к/с. Подробнее — в разделе «Лимиты».'),
     ),
     startBtn,
+    progressWrap,
     status,
   );
   syncControls();
+  void measureRefreshHz().then((hz) => {
+    refreshHz = hz;
+    // A running player keeps its settings; they are re-synced when it closes.
+    if (!player && !disposed) syncControls();
+  });
+  // Rotating a tablet or resizing the window changes what "Авто" picks.
+  const onResize = (): void => {
+    if (settings.preset === 'auto' && !player) syncControls();
+  };
+  window.addEventListener('resize', onResize);
 
-  return () => player?.destroy();
+  return () => {
+    disposed = true;
+    window.removeEventListener('resize', onResize);
+    packing?.abort();
+    player?.destroy();
+  };
+}
+
+/**
+ * Warns when a 60 fps camera gets too few frames per code: camera and screen run at
+ * nearly the same rate, so their phase drifts only slowly, and at a bad phase no
+ * code is captured cleanly for tens of seconds — repeatedly, at equal intervals.
+ */
+function phaseLockWarning(fps: number, refreshHz: number): string {
+  const worst = worstPhaseCapture({ ...DEFAULT_CHANNEL, refreshHz, displayFps: fps, cameraFps: 60, shutterMs: 10 });
+  if (worst >= 0.5) return '';
+  const frames = Number((60 / fps).toFixed(1));
+  return `При ${fps} сменах/с на каждый код приходится всего ${frames} кадр${frames === 1 ? '' : 'а'} камеры 60 к/с: частоты экрана и камеры почти равны, и приём будет периодически замирать на десятки секунд. Для камеры 60 к/с ставьте не больше 20 смен/с.`;
 }
 
 // ---------------------------------------------------------------------------
 
 const QUEUE_TARGET = 6;
+/** How often the last shown symbol id is saved for resuming (also saved on stop). */
+const POSITION_SAVE_MS = 1000;
 
 class Player {
   private readonly worker: Worker;
@@ -245,6 +463,9 @@ class Player {
   private readonly srcCtx = this.src.getContext('2d')!;
   private queue: RenderedFrame[] = [];
   private nextId = 0;
+  private transferId = 0;
+  private lastShownId = -1;
+  private positionSavedAt = 0;
   private inflight = false;
   private epoch = 0;
   private K = 0;
@@ -306,13 +527,13 @@ class Player {
       stream: this.stream,
       version: this.settings.version,
       ecc: this.settings.ecc,
-      transferId: randomTransferId(),
     });
     this.updateFpsLabel();
     this.raf = requestAnimationFrame(this.tick);
   }
 
   destroy(): void {
+    this.savePosition();
     cancelAnimationFrame(this.raf);
     this.worker.terminate();
     window.removeEventListener('resize', this.onResize);
@@ -333,6 +554,9 @@ class Player {
       this.G = msg.G;
       this.blockSize = msg.blockSize;
       this.qrSize = msg.size;
+      // Same file and settings as before ⇒ same id: continue after the last symbol shown.
+      this.transferId = msg.transferId;
+      this.nextId = sendStartId(storageOrNull(), msg.transferId);
       this.layout();
       this.requestFrames();
     } else if (msg.type === 'frames') {
@@ -357,16 +581,21 @@ class Player {
     if (!this.qrSize) return;
     const n = this.settings.codes;
     const box = this.codesBox.getBoundingClientRect();
-    const landscape = box.width >= box.height;
-    const cols = n === 1 ? 1 : n === 2 ? (landscape ? 2 : 1) : 2;
+    // Two codes are always stacked: a phone filming in portrait sees a tall frame,
+    // so a vertical pair fills it best on any sender screen.
+    const cols = n === 4 ? 2 : 1;
     const rows = n / cols;
     const dpr = window.devicePixelRatio || 1;
     const total = this.qrSize + 8;
+    // Several codes get 4 extra modules of white between them, so the receiver
+    // never pairs finder patterns of neighbouring codes and can track each one.
+    const gapModules = n > 1 ? 4 : 0;
     const cell = Math.min(box.width / cols, box.height / rows);
     // Integer device pixels per module keep every module the same width (no moiré).
-    const scale = Math.max(1, Math.floor((cell * dpr) / total));
+    const scale = Math.max(1, Math.floor((cell * dpr) / (total + gapModules)));
     const px = total * scale;
     this.codesBox.style.gridTemplateColumns = `repeat(${cols}, auto)`;
+    this.codesBox.style.gap = `${(gapModules * scale) / dpr}px`;
     if (this.canvases.length !== n) {
       clear(this.codesBox);
       this.canvases = Array.from({ length: n }, () => h('canvas'));
@@ -404,8 +633,16 @@ class Player {
     this.switches.push(now);
     while (this.switches.length && now - this.switches[0] > 1000) this.switches.shift();
     this.requestFrames();
-    this.updateInfo(frames[n - 1].symbolId);
+    this.lastShownId = frames[n - 1].symbolId;
+    this.updateInfo(this.lastShownId);
+    if (now - this.positionSavedAt >= POSITION_SAVE_MS) this.savePosition(now);
   };
+
+  private savePosition(now = performance.now()): void {
+    if (this.lastShownId < 0) return;
+    this.positionSavedAt = now;
+    saveSendPosition(storageOrNull(), this.transferId, this.lastShownId);
+  }
 
   private draw(canvas: HTMLCanvasElement, frame: RenderedFrame): void {
     if (this.src.width !== frame.width) this.src.width = this.src.height = frame.width;

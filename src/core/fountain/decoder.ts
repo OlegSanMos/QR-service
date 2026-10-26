@@ -215,6 +215,11 @@ export class FountainDecoder {
   }
 
   /** A copy of source block b if it is already known (e.g. to read metadata early). */
+  hasBlock(b: number): boolean {
+    const { g, local } = this.layout.locate(b);
+    return this.gens[g].isKnown(local);
+  }
+
   getBlock(b: number): Uint8Array | null {
     const { g, local } = this.layout.locate(b);
     if (!this.gens[g].isKnown(local)) return null;

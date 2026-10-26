@@ -109,6 +109,67 @@ export function estimateThroughput(version: number, ecc: Ecc, codesPerScreen: nu
   };
 }
 
+/**
+ * Share of codes that get at least one clean camera frame at the WORST phase
+ * between camera and screen (1 = every phase is fine).
+ *
+ * The random-phase model above is only right on average. A 60 fps camera and a
+ * 60 Hz panel (or 30 fps and 60 Hz) run from independent clocks at the same
+ * nominal rate, so their phase does not jump around — it drifts by a fraction of
+ * a millisecond per second. When a code lasts a whole number of camera frames,
+ * every code is then sampled at the same offset: if the clean window
+ * T_d − t_s − τ is shorter than T_c, a band of phases misses EVERY code, and
+ * reception stops until the drift carries the phase out of that band. It comes
+ * back with the beat period 1/|f_c − k·f_r| (tens of seconds to minutes), i.e.
+ * the transfer stalls repeatedly at equal intervals.
+ */
+export function worstPhaseCapture(p: ChannelParams, codes = 600, phases = 240): number {
+  const Tr = 1000 / p.refreshHz;
+  const Td = 1000 / Math.min(p.displayFps, p.refreshHz);
+  const Tc = 1000 / p.cameraFps;
+  const ts = p.scanFraction * Tr;
+  const tau = p.shutterMs;
+  // Codes start on vsync (as the player shows them): start k = round(k·Td / Tr)·Tr.
+  const starts = new Float64Array(codes + 1);
+  for (let k = 0; k <= codes; k++) starts[k] = Math.round((k * Td) / Tr) * Tr;
+  let worst = 1;
+  for (let i = 0; i < phases; i++) {
+    const phase = (i / phases) * Tc;
+    let ok = 0;
+    for (let k = 0; k < codes; k++) {
+      // First camera frame that starts after the code has been fully drawn.
+      const n = Math.ceil((starts[k] + ts - phase) / Tc - 1e-9);
+      if (phase + n * Tc + tau <= starts[k + 1] + 1e-9) ok++;
+    }
+    worst = Math.min(worst, ok / codes);
+  }
+  return worst;
+}
+
+/** Refresh rates of common screens (Hz). */
+export const COMMON_PANELS = [60, 75, 90, 100, 120, 144, 165, 240];
+
+/**
+ * Whether a camera at `cameraFps` risks periodic stalls on a sender that changes
+ * codes `rate` times a second, when the receiver does not know the sender's
+ * screen. A player shows each code for a whole number of refreshes, so the rate
+ * tells which panels are possible (rate ≈ R/k). 'sure': stalls on every such
+ * panel; 'if60': only on a 60 Hz one (30/s is fine on 90-240 Hz panels);
+ * 'none' otherwise.
+ */
+export function stallRisk(rate: number, cameraFps: number, shutterMs = 10): 'none' | 'if60' | 'sure' {
+  if (!(rate > 0)) return 'none';
+  const bad = (R: number): boolean => worstPhaseCapture({ ...DEFAULT_CHANNEL, refreshHz: R, displayFps: R / Math.round(R / rate), cameraFps, shutterMs }, 300, 120) < 0.75;
+  const panels = COMMON_PANELS.filter((R) => {
+    const k = Math.round(R / rate);
+    return k >= 1 && Math.abs(R / k - rate) <= rate * 0.04;
+  });
+  if (panels.length === 0) return 'none';
+  const risky = panels.filter(bad);
+  if (risky.length === panels.length) return 'sure';
+  return risky.includes(60) ? 'if60' : 'none';
+}
+
 /** Camera pixels per module needed for reliable detection (Nyquist ×2 plus margin for blur/perspective). */
 export const MIN_PIXELS_PER_MODULE = 3;
 
@@ -123,3 +184,55 @@ export const PROTOCOL_LIMITS = {
   maxStreamBytes: 0xffffffff,
   headerBytes: HEADER_SIZE,
 } as const;
+
+/**
+ * Receiver camera profiles the sender cannot tell apart (there is no back
+ * channel): browsers deliver 30 fps (slow rolling shutter) or 60 fps. The
+ * weights favour 60 fps, which current phones reach in the app's default mode.
+ */
+export const CAMERA_PROFILES: { weight: number; cameraFps: number; shutterMs: number }[] = [
+  { weight: 0.35, cameraFps: 30, shutterMs: 20 },
+  { weight: 0.65, cameraFps: 60, shutterMs: 10 },
+];
+
+/** Weighted geometric mean of distinct codes/s over the camera profiles. */
+export function robustCodesPerSecond(displayFps: number, refreshHz: number): number {
+  let logSum = 0;
+  for (const p of CAMERA_PROFILES) {
+    const n = uniqueCodesPerSecond({ ...DEFAULT_CHANNEL, refreshHz, displayFps, cameraFps: p.cameraFps, shutterMs: p.shutterMs, decodeFps: Infinity });
+    logSum += p.weight * Math.log(Math.max(n, 1e-6));
+  }
+  return Math.exp(logSum);
+}
+
+/** Display rate (refresh / n) that is fastest in practice for an unknown receiver camera. */
+export function autoDisplayFps(refreshHz: number): number {
+  let best = refreshHz;
+  let bestRate = -1;
+  for (let n = 1; n <= 16; n++) {
+    const fps = refreshHz / n;
+    const rate = robustCodesPerSecond(fps, refreshHz);
+    if (rate > bestRate + 1e-9) {
+      bestRate = rate;
+      best = fps;
+    }
+  }
+  return best;
+}
+
+/** Expected useful bytes/s averaged over the camera profiles (for compression decisions). */
+export function expectedLinkBytesPerSecond(version: number, ecc: Ecc, codes: number, displayFps: number, refreshHz: number): number {
+  let sum = 0;
+  for (const p of CAMERA_PROFILES) {
+    sum += p.weight * estimateThroughput(version, ecc, codes, { ...DEFAULT_CHANNEL, refreshHz, displayFps, cameraFps: p.cameraFps, shutterMs: p.shutterMs }).bytesPerSecond;
+  }
+  return Math.max(1000, sum);
+}
+
+/** Snaps a measured frame interval to a common panel refresh rate. */
+export function snapRefreshHz(measured: number): number {
+  const common = [24, 30, 48, 50, 60, 75, 90, 100, 120, 144, 165, 240];
+  let best = 60;
+  for (const hz of common) if (Math.abs(hz - measured) < Math.abs(best - measured)) best = hz;
+  return Math.abs(best - measured) / best < 0.12 ? best : Math.round(measured);
+}

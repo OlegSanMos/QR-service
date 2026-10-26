@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { packContainer, unpackContainer } from '../src/core/container';
+import { packFiles, unpackContainer } from '../src/core/container';
 import { Prng } from '../src/core/prng';
 import { TransferEncoder, TransferReceiver } from '../src/core/transfer';
 import { photograph } from './helpers/camera';
@@ -9,7 +9,7 @@ describe('end-to-end: file → QR frames → camera → file', () => {
   it('transfers a file through simulated camera captures with frame loss', async () => {
     const rng = new Prng(42);
     const data = new Uint8Array(6000).map(() => rng.nextU32() & 0xff);
-    const packed = await packContainer({ name: 'photo.bin', mime: 'application/octet-stream', data });
+    const packed = await packFiles([{ name: 'photo.bin', mime: 'application/octet-stream', data }]);
     const sender = new TransferEncoder(packed.stream, { version: 12, ecc: 'M' });
     const receiver = new TransferReceiver();
 
@@ -38,9 +38,9 @@ describe('end-to-end: file → QR frames → camera → file', () => {
       }
     }
     const status = receiver.status!;
-    expect(status.info).toMatchObject({ name: 'photo.bin', size: data.length });
+    expect(status.info?.files).toEqual([{ name: 'photo.bin', mime: 'application/octet-stream', size: data.length }]);
     const file = await unpackContainer(receiver.stream());
-    expect(Array.from(file.data)).toEqual(Array.from(data));
+    expect(Array.from(file.files[0].data)).toEqual(Array.from(data));
     expect(decodedFrames).toBeGreaterThan(0);
   }, 60_000);
 
@@ -65,5 +65,22 @@ describe('end-to-end: file → QR frames → camera → file', () => {
     const rx = new TransferReceiver();
     expect(rx.ingest(new TextEncoder().encode('WIFI:S:home;T:WPA;P:secret;;'), 0).kind).toBe('foreign');
     expect(rx.status).toBeNull();
+  });
+
+  it('shows the file list of a large folder before the transfer ends', async () => {
+    // 7000 files: the archive header alone spans hundreds of blocks.
+    const files = Array.from({ length: 7000 }, (_, i) => ({ name: `folder/sub/file-${i}.txt`, mime: 'text/plain', data: new Uint8Array(100).fill(i & 255) }));
+    const packed = await packFiles(files, { method: 'store' });
+    const enc = new TransferEncoder(packed.stream, { version: 25, ecc: 'L' });
+    const rx = new TransferReceiver();
+    let knownAt = -1;
+    for (let id = 0; !rx.complete; id++) {
+      rx.ingest(enc.frame(id), id);
+      if (knownAt < 0 && rx.status?.info) knownAt = id;
+    }
+    expect(knownAt).toBeGreaterThan(0);
+    expect(knownAt).toBeLessThan(enc.K * 0.75);
+    expect(rx.status!.info!.files.length).toBe(7000);
+    expect(rx.status!.info!.files[6999].name).toBe('folder/sub/file-6999.txt');
   });
 });

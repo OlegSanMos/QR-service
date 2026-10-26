@@ -2,7 +2,7 @@
 //
 //   offset size field
 //   0      1    magic 0x51 ('Q'), identifies protocol v1
-//   1      4    transferId   random per transfer; lets the receiver ignore stale codes
+//   1      4    transferId   hash of the content (transferIdFor); tells transfers apart
 //   5      4    totalLength  length of the container stream (metadata + file)
 //   9      2    blockSize    payload bytes per symbol (constant within a transfer)
 //   11     4    symbolId     fountain symbol id (see fountain/layout.ts)
@@ -61,6 +61,12 @@ export function buildFrame(header: FrameHeader, fill: (payload: Uint8Array) => v
   fill(payload);
   whiten(payload, header.transferId, header.symbolId);
   return out;
+}
+
+/** Symbol id of a frame without parsing the payload; null for anything that is not ours. */
+export function peekSymbolId(bytes: Uint8Array): number | null {
+  if (bytes.length <= HEADER_SIZE || bytes[0] !== FRAME_MAGIC) return null;
+  return new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getUint32(11, true);
 }
 
 /** Parses and de-whitens a frame; returns null for anything that is not ours. */
