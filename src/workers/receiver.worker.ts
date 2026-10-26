@@ -69,6 +69,14 @@ function handle(msg: ReceiverRequest): Promise<void> | void {
       void recorder?.forget(msg.transferId);
       if (receiver.status?.transferId === msg.transferId) clearSession();
       return;
+    case 'delivered':
+      void recorder?.forget(msg.transferId);
+      return;
+    case 'flush':
+      void recorder?.flush();
+      return;
+    case 'close':
+      return (recorder?.flush() ?? Promise.resolve()).catch(() => {}).finally(() => self.close());
   }
 }
 
@@ -90,8 +98,9 @@ function postComplete(): void {
   completedSent = true;
   const status = receiver.status!;
   const stream = receiver.stream();
+  // The stored frames stay until the page reports the files unpacked ('delivered'):
+  // unpacking is the memory peak, and a tab killed there must find the data again.
   post({ type: 'complete', status, stream }, [stream.buffer]);
-  void recorder?.forget(status.transferId);
 }
 
 function ingest(codes: Uint8Array[], now: number): void {

@@ -25,7 +25,7 @@ interface SendSettings {
 const AUTO_VERSION = 25;
 
 const PRESETS: { id: string; label: string; hint: string; s?: Omit<SendSettings, 'preset' | 'method'> }[] = [
-  { id: 'auto', label: '⚡ Авто', hint: 'самый быстрый режим для любой камеры получателя: подстраивается под экран, на широком экране показывает 2 кода' },
+  { id: 'auto', label: '⚡ Авто', hint: 'самый быстрый режим для любой камеры получателя: подстраивается под экран, на экране ноутбука или планшета показывает 2 кода друг над другом' },
   { id: 'reliable', label: 'Надёжно', hint: 'старые телефоны, плохой свет', s: { version: 14, ecc: 'M', fps: 7.5, codes: 1 } },
   { id: 'cam30', label: '30 к/с', hint: 'камера получателя снимает 30 к/с', s: { version: 25, ecc: 'L', fps: 15, codes: 1 } },
   { id: 'cam60', label: '60 к/с', hint: 'камера получателя 60 к/с (по умолчанию на приёме)', s: { version: 25, ecc: 'L', fps: 20, codes: 1 } },
@@ -53,6 +53,33 @@ function saveSettings(s: SendSettings): void {
   }
 }
 
+const METHODS_KEY = 'qr-send-methods';
+const METHODS_KEPT = 32;
+
+/** Compression methods 'auto' chose for recent contents (see PackResult.key), oldest first. */
+function loadMethods(): Record<string, Method> {
+  try {
+    const raw = localStorage.getItem(METHODS_KEY);
+    if (raw) return JSON.parse(raw) as Record<string, Method>;
+  } catch {
+    // unavailable or corrupt: choose afresh
+  }
+  return {};
+}
+
+function rememberMethod(key: string, method: Method): void {
+  const all = loadMethods();
+  delete all[key];
+  all[key] = method;
+  const keys = Object.keys(all);
+  for (const k of keys.slice(0, Math.max(0, keys.length - METHODS_KEPT))) delete all[k];
+  try {
+    localStorage.setItem(METHODS_KEY, JSON.stringify(all));
+  } catch {
+    // ignore
+  }
+}
+
 function storageOrNull(): Storage | null {
   try {
     return localStorage;
@@ -62,10 +89,10 @@ function storageOrNull(): Storage | null {
 }
 
 /**
- * Two codes side by side fit a landscape laptop/tablet screen: each is still
- * large enough for a phone camera framing the whole screen (v25: ~254 modules
- * across, ≥ 4 camera px per module at 720p). On phones and portrait screens one
- * big code is faster to aim at.
+ * Two stacked codes suit a laptop or landscape tablet: each is still large on
+ * screen, and the pair (v25: ~254 modules tall, 125 wide) fills the portrait
+ * frame of a phone camera at ≥ 4 camera px per module even at 720p. On phones
+ * and portrait screens one big code is faster to aim at.
  */
 function wideScreen(): boolean {
   const w = Math.max(window.screen?.width ?? 0, window.innerWidth);
@@ -116,8 +143,15 @@ async function readEntry(entry: FileSystemEntry, prefix: string, out: { file: Fi
 export function renderSend(root: HTMLElement): () => void {
   const settings = loadSettings();
   let files: FileEntry[] = [];
+  /** The entry made from the text box (by identity: a picked file may have the same name). */
+  let textEntry: FileEntry | null = null;
   let player: Player | null = null;
   let refreshHz = 60;
+  /** Compression in progress (aborted by the cancel button or when leaving the page). */
+  let packing: AbortController | null = null;
+  let disposed = false;
+  /** Last packed stream: Stop then Start with the same files sends exactly the same stream. */
+  let packedCache: { files: FileEntry[]; method: SendSettings['method']; stream: Uint8Array; packed: Method } | null = null;
 
   // ---- source selection ----------------------------------------------------
   const fileInput = h('input', { type: 'file', multiple: true });
@@ -143,19 +177,22 @@ export function renderSend(root: HTMLElement): () => void {
     for (const { file, path } of list) {
       read.push({ name: path, mime: file.type || 'application/octet-stream', data: new Uint8Array(await file.arrayBuffer()) });
     }
-    files = files.filter((f) => f.name !== 'текст.txt' || textArea.value !== '').concat(read);
+    files = files.concat(read);
     renderChosen();
   }
 
   function renderChosen(): void {
     clear(chosen);
-    if (files.length === 0) return;
+    if (files.length === 0) {
+      updateSummary();
+      return;
+    }
     const total = files.reduce((s, f) => s + f.data.length, 0);
     const list = h('div', { class: 'file-list' });
     for (const f of files.slice(0, 6)) list.appendChild(h('div', null, `• ${f.name} — ${formatBytes(f.data.length)}`));
     if (files.length > 6) list.appendChild(h('div', { class: 'muted' }, `… и ещё ${files.length - 6}`));
     chosen.append(
-      h('div', { class: 'row' }, h('b', { class: 'grow' }, `✔ ${describeFiles(files)} · ${formatBytes(total)}`), h('button', { onclick: () => ((files = []), (textArea.value = ''), renderChosen()) }, 'Очистить')),
+      h('div', { class: 'row' }, h('b', { class: 'grow' }, `✔ ${describeFiles(files)} · ${formatBytes(total)}`), h('button', { onclick: () => ((files = []), (textEntry = null), (textArea.value = ''), renderChosen()) }, 'Очистить')),
       list,
     );
     updateSummary();
@@ -183,10 +220,10 @@ export function renderSend(root: HTMLElement): () => void {
     }
   });
   textArea.addEventListener('input', () => {
-    files = files.filter((f) => f.name !== 'текст.txt');
-    if (textArea.value) files.push({ name: 'текст.txt', mime: 'text/plain;charset=utf-8', data: new TextEncoder().encode(textArea.value) });
+    files = files.filter((f) => f !== textEntry);
+    textEntry = textArea.value ? { name: 'текст.txt', mime: 'text/plain;charset=utf-8', data: new TextEncoder().encode(textArea.value) } : null;
+    if (textEntry) files.push(textEntry);
     renderChosen();
-    updateSummary();
   });
 
   // ---- mode & settings ---------------------------------------------------------
@@ -287,7 +324,8 @@ export function renderSend(root: HTMLElement): () => void {
       warn.appendChild(h('div', { class: 'note', style: 'margin-top:10px' }, 'Несколько крупных кодов требуют большого экрана отправителя и камеры 1080p+ у получателя.'));
   }
 
-  const startBtn = h('button', { class: 'primary wide', onclick: () => void start() }, '▶ Начать передачу');
+  const START_LABEL = '▶ Начать передачу';
+  const startBtn = h('button', { class: 'primary wide', onclick: () => (packing ? packing.abort() : void start()) }, START_LABEL);
   const status = h('div', { class: 'small', style: 'margin-top:8px' });
   const progressBar = h('div');
   const progressWrap = h('div', { class: 'progress', style: 'display:none' }, progressBar);
@@ -297,10 +335,9 @@ export function renderSend(root: HTMLElement): () => void {
       status.textContent = 'Сначала выберите файлы или введите текст.';
       return;
     }
-    startBtn.disabled = true;
-    progressWrap.style.display = '';
-    progressBar.style.width = '0';
-    const total = files.reduce((s, f) => s + f.data.length, 0);
+    const chosenFiles = files; // the list may change while compressing
+    const method = settings.method;
+    const total = chosenFiles.reduce((s, f) => s + f.data.length, 0);
     const t0 = performance.now();
     const onProgress = (p: CodecProgress): void => {
       const pct = p.total ? (p.done / p.total) * 100 : 0;
@@ -308,24 +345,43 @@ export function renderSend(root: HTMLElement): () => void {
       status.textContent = p.phase === 'cm' ? `Сжатие (контекстное смешивание): ${pct.toFixed(0)}%` : 'Сжатие…';
     };
     try {
-      const packed = await packInWorker(files, { method: settings.method, linkBytesPerSecond: linkRate() }, onProgress);
-      const secs = (performance.now() - t0) / 1000;
-      const saved = total > 0 ? Math.max(0, 1 - packed.stream.length / total) : 0;
-      status.textContent =
-        `${METHOD_LABELS[packed.method]}: ${formatBytes(total)} → ${formatBytes(packed.stream.length)}` +
-        (saved > 0.005 ? ` (−${Math.round(saved * 100)}%)` : '') +
-        ` за ${formatDuration(secs)} · передача ≈ ${formatDuration(packed.stream.length / linkRate())}`;
+      let packed = packedCache && packedCache.files === chosenFiles && packedCache.method === method ? packedCache : null;
+      if (!packed) {
+        packing = new AbortController();
+        startBtn.textContent = '✕ Отменить сжатие';
+        progressWrap.style.display = '';
+        progressBar.style.width = '0';
+        const r = await packInWorker(chosenFiles, { method, linkBytesPerSecond: linkRate(), remembered: loadMethods(), signal: packing.signal }, onProgress);
+        // The same content must give the same stream (and transfer id) after a
+        // reload too, whatever the CPU load: remember what 'auto' chose.
+        if (method === 'auto') rememberMethod(r.key, r.method);
+        packed = packedCache = { files: chosenFiles, method, stream: r.stream, packed: r.method };
+        const secs = (performance.now() - t0) / 1000;
+        const saved = total > 0 ? Math.max(0, 1 - r.stream.length / total) : 0;
+        status.textContent =
+          `${METHOD_LABELS[r.method]}: ${formatBytes(total)} → ${formatBytes(r.stream.length)}` +
+          (saved > 0.005 ? ` (−${Math.round(saved * 100)}%)` : '') +
+          ` за ${formatDuration(secs)} · передача ≈ ${formatDuration(r.stream.length / linkRate())}`;
+      }
+      packing = null;
+      startBtn.textContent = START_LABEL;
       progressWrap.style.display = 'none';
+      if (disposed) return;
+      startBtn.disabled = true;
       player?.destroy();
-      player = new Player(packed.stream, settings, describeFiles(files), () => {
+      player = new Player(packed.stream, settings, describeFiles(chosenFiles), () => {
         player = null;
         startBtn.disabled = false;
+        if (!disposed) syncControls(); // a screen measured or resized meanwhile
       });
       await player.start();
     } catch (err) {
-      progressWrap.style.display = 'none';
-      status.textContent = `Ошибка: ${err instanceof Error ? err.message : String(err)}`;
+      packing = null;
+      startBtn.textContent = START_LABEL;
       startBtn.disabled = false;
+      progressWrap.style.display = 'none';
+      const cancelled = err instanceof DOMException && err.name === 'AbortError';
+      status.textContent = cancelled ? 'Сжатие отменено.' : `Ошибка: ${err instanceof Error ? err.message : String(err)}`;
     }
   }
 
@@ -359,7 +415,8 @@ export function renderSend(root: HTMLElement): () => void {
   syncControls();
   void measureRefreshHz().then((hz) => {
     refreshHz = hz;
-    syncControls();
+    // A running player keeps its settings; they are re-synced when it closes.
+    if (!player && !disposed) syncControls();
   });
   // Rotating a tablet or resizing the window changes what "Авто" picks.
   const onResize = (): void => {
@@ -368,7 +425,9 @@ export function renderSend(root: HTMLElement): () => void {
   window.addEventListener('resize', onResize);
 
   return () => {
+    disposed = true;
     window.removeEventListener('resize', onResize);
+    packing?.abort();
     player?.destroy();
   };
 }
@@ -522,8 +581,9 @@ class Player {
     if (!this.qrSize) return;
     const n = this.settings.codes;
     const box = this.codesBox.getBoundingClientRect();
-    const landscape = box.width >= box.height;
-    const cols = n === 1 ? 1 : n === 2 ? (landscape ? 2 : 1) : 2;
+    // Two codes are always stacked: a phone filming in portrait sees a tall frame,
+    // so a vertical pair fills it best on any sender screen.
+    const cols = n === 4 ? 2 : 1;
     const rows = n / cols;
     const dpr = window.devicePixelRatio || 1;
     const total = this.qrSize + 8;

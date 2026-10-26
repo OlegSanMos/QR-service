@@ -79,7 +79,7 @@ test('receiver decodes the fake camera stream and offers the file', async ({ pag
   await expect(page.getByText(/сжатие CM/)).toBeVisible();
   await expect(page.getByText(/CRC-32 ✔/)).toBeVisible();
   await expect(page.getByText(/data\/table\.csv/)).toBeVisible();
-  const [download] = await Promise.all([page.waitForEvent('download'), page.getByRole('link', { name: /Сохранить всё/ }).click()]);
+  const [download] = await Promise.all([page.waitForEvent('download'), page.getByRole('button', { name: /Сохранить всё/ }).click()]);
   const zipPath = await download.path();
   const read = (name: string): Buffer =>
     execFileSync('python3', ['-I', '-c', 'import zipfile,sys; sys.stdout.buffer.write(zipfile.ZipFile(sys.argv[1]).read(sys.argv[2]))', zipPath, name]);
@@ -88,7 +88,7 @@ test('receiver decodes the fake camera stream and offers the file', async ({ pag
   expect(read('data/random.bin').equals(readFileSync(FAKE_CAMERA_SOURCE_BIN))).toBe(true);
 });
 
-test('auto mode shows two codes on a wide screen and one on a phone', async ({ page }) => {
+test('auto mode shows two stacked codes on a wide screen and one on a phone', async ({ page }) => {
   for (const [viewport, expected] of [
     [{ width: 1280, height: 720 }, 2],
     [{ width: 412, height: 915 }, 1],
@@ -99,6 +99,12 @@ test('auto mode shows two codes on a wide screen and one on a phone', async ({ p
     await expect(page.getByRole('button', { name: /Авто/ })).toHaveClass(/on/);
     await page.getByRole('button', { name: /Начать передачу/ }).click();
     await expect(page.locator('.stage canvas')).toHaveCount(expected);
+    if (expected === 2) {
+      // Always one above the other, even on a landscape screen.
+      const [a, b] = await Promise.all([page.locator('.stage canvas').nth(0).boundingBox(), page.locator('.stage canvas').nth(1).boundingBox()]);
+      expect(b!.y).toBeGreaterThanOrEqual(a!.y + a!.height);
+      expect(Math.abs(b!.x - a!.x)).toBeLessThan(1);
+    }
     await page.getByRole('button', { name: /Стоп/ }).click();
   }
 });

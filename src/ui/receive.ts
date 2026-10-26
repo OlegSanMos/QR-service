@@ -2,6 +2,7 @@ import { describeFiles, type FileEntry, type Method } from '../core/container';
 import { createZip } from '../core/zip';
 import { unpackInWorker } from './codec';
 import { peekSymbolId } from '../core/protocol';
+import { stallRisk } from '../core/limits';
 import type { Rect } from '../core/roi';
 import { CodeTracker, MAX_TRACKS } from '../core/tracks';
 import type { ReceiverStatus } from '../core/transfer';
@@ -13,6 +14,8 @@ interface Crop extends Rect {
   scale: number;
   /** Track this region follows (see core/tracks.ts), or null for a search of the whole frame. */
   trackId: number | null;
+  /** Frame areas painted white before decoding (codes that are tracked already). */
+  mask?: Rect[];
 }
 
 /** Round-robin pool of ZXing workers; a frame is dropped when every worker is busy. */
@@ -139,10 +142,11 @@ export function renderReceive(root: HTMLElement): () => void {
   const stats = h('div', { class: 'stats' });
   const result = h('div');
   const errorBox = h('div');
+  const resumeText = h('div', null, 'Продолжаем прерванный приём');
   const resumeNote = h(
     'div',
     { class: 'note', style: 'margin-top:10px;display:none' },
-    h('div', null, 'Продолжаем прерванный приём — включите камеру'),
+    resumeText,
     h('button', { style: 'margin-top:8px', onclick: () => discardRestored() }, 'Начать заново'),
   );
 
@@ -183,6 +187,10 @@ export function renderReceive(root: HTMLElement): () => void {
   /** [time, symbol id] of recently decoded codes, to measure how fast the sender changes codes. */
   let idTrail: [number, number][] = [];
   let frameCounter = 0;
+  /** Full-frame probes: next one at this frameCounter; probe often until the tracked set settles. */
+  let nextProbeAt = 0;
+  let probeTrackCount = 0;
+  let probeSettleUntil = 0;
   let dropped = 0;
   let decodeMs = 0;
   const cameraRate = new Rate();
@@ -262,8 +270,13 @@ export function renderReceive(root: HTMLElement): () => void {
   // ---- resuming an interrupted transfer ------------------------------------------
   let restoredId: number | null = null;
 
+  let restoredRank = 0;
+
   function showRestored(s: ReceiverStatus): void {
     restoredId = s.transferId;
+    restoredRank = s.rank;
+    // The camera may already be on (started by itself): then only the option to start over matters.
+    resumeText.textContent = running || cameraBtn.disabled ? 'Продолжаем прерванный приём' : 'Продолжаем прерванный приём — включите камеру';
     resumeNote.style.display = '';
   }
 
@@ -284,6 +297,12 @@ export function renderReceive(root: HTMLElement): () => void {
     fileLabel.textContent = '';
   }
 
+  // A background tab may be killed without warning (iOS): store what is pending.
+  const onHidden = (): void => {
+    if (document.visibilityState === 'hidden') post({ type: 'flush' });
+  };
+  document.addEventListener('visibilitychange', onHidden);
+
   // Once the camera is being switched on, the "turn the camera on" note is done.
   cameraBtn.addEventListener('click', hideRestored);
 
@@ -303,6 +322,8 @@ export function renderReceive(root: HTMLElement): () => void {
 
   function updateStatus(s: ReceiverStatus | null, now: number): void {
     status = s;
+    // Reception has visibly continued: "Начать заново" would now throw away fresh progress.
+    if (restoredId !== null && s && s.transferId === restoredId && s.rank > restoredRank) hideRestored();
     if (s && s.rank > lastRank) {
       rankRate.add(now, s.rank - lastRank);
       lastRank = s.rank;
@@ -310,13 +331,23 @@ export function renderReceive(root: HTMLElement): () => void {
   }
 
   // ---- camera ------------------------------------------------------------------
+  /**
+   * Bumped by every camera start and by stopping for good: a start that is still
+   * waiting for getUserMedia when another one begins (the automatic start and a
+   * tap, a camera switch) must not keep its stream or run a second capture loop.
+   */
+  let cameraGen = 0;
+
   async function startCamera(deviceId?: string): Promise<void> {
     clear(errorBox);
     if (!navigator.mediaDevices?.getUserMedia) {
       showError('Камера недоступна. Откройте приложение по HTTPS (или localhost) в современном браузере.');
       return;
     }
+    const gen = ++cameraGen;
+    const superseded = (): boolean => gen !== cameraGen || destroyed;
     stopCamera();
+    cameraBtn.disabled = true;
     const width = Number(resolutionSelect.value);
     const fps = Number(fpsSelect.value);
     const source: MediaTrackConstraints = deviceId ? { deviceId: { exact: deviceId } } : { facingMode: { ideal: 'environment' } };
@@ -330,9 +361,10 @@ export function renderReceive(root: HTMLElement): () => void {
       { ...source },
     ];
     let lastError: unknown = null;
+    let opened: MediaStream | null = null;
     for (const video of attempts) {
       try {
-        stream = await navigator.mediaDevices.getUserMedia({ audio: false, video });
+        opened = await navigator.mediaDevices.getUserMedia({ audio: false, video });
         break;
       } catch (err) {
         lastError = err;
@@ -340,14 +372,16 @@ export function renderReceive(root: HTMLElement): () => void {
         if (!(err instanceof Error) || (err.name !== 'OverconstrainedError' && err.name !== 'ConstraintNotSatisfiedError')) break;
       }
     }
-    if (!stream) {
+    if (superseded()) {
+      opened?.getTracks().forEach((t) => t.stop());
+      return;
+    }
+    cameraBtn.disabled = false;
+    if (!opened) {
       showError(`Не удалось открыть камеру: ${lastError instanceof Error ? lastError.message : String(lastError)}`);
       return;
     }
-    if (destroyed) {
-      stopCamera();
-      return;
-    }
+    stream = opened;
     video.srcObject = stream;
     await video.play().catch(() => {});
     placeholder.style.display = 'none';
@@ -357,6 +391,7 @@ export function renderReceive(root: HTMLElement): () => void {
     const track = stream.getVideoTracks()[0];
     await tuneTrack(track);
     await listCameras(track.getSettings().deviceId);
+    if (superseded()) return;
     describeCamera(track);
     tracker.reset(video.videoWidth || 1, video.videoHeight || 1);
     lastPresented = -1;
@@ -423,8 +458,10 @@ export function renderReceive(root: HTMLElement): () => void {
 
   function scheduleFrame(): void {
     if (!running) return;
-    if (hasRVFC) video.requestVideoFrameCallback((_now, meta) => onFrame(meta.presentedFrames));
-    else requestAnimationFrame(() => onFrame());
+    // A callback registered for an earlier camera start belongs to a loop that has ended.
+    const gen = cameraGen;
+    if (hasRVFC) video.requestVideoFrameCallback((_now, meta) => gen === cameraGen && onFrame(meta.presentedFrames));
+    else requestAnimationFrame(() => gen === cameraGen && onFrame());
   }
 
   function onFrame(presentedFrames?: number): void {
@@ -458,26 +495,38 @@ export function renderReceive(root: HTMLElement): () => void {
       return;
     }
     frameCounter++;
-    // Every 15th frame (and whenever nothing is tracked) one decoder searches the
-    // whole frame for up to MAX_TRACKS codes, so newly visible codes get tracks;
+    // About every 15th frame (and whenever nothing is tracked) one decoder searches
+    // the whole frame for up to MAX_TRACKS codes, so newly visible codes get tracks;
     // the other decoders each read one tracked code, least recently served first.
     const tracks = tracker.all;
-    if (tracks.length === 0 || frameCounter % 15 === 0) {
+    if (tracks.length !== probeTrackCount) {
+      probeTrackCount = tracks.length;
+      probeSettleUntil = frameCounter + 30;
+      nextProbeAt = Math.min(nextProbeAt, frameCounter + 3);
+    }
+    if (tracks.length === 0 || frameCounter >= nextProbeAt) {
+      // Right after codes appeared or vanished, look again soon: a neighbour may just
+      // have been unreadable (caught mid-change). Otherwise the interval is jittered,
+      // so probes cannot stay in step with something periodic on the sender's side.
+      nextProbeAt = frameCounter + (frameCounter < probeSettleUntil ? 3 : 10 + Math.floor(Math.random() * 11));
       let crop: Crop;
       if (tracks.length === 0 && cropSelect.value === 'center') {
         const side = Math.min(vw, vh);
         crop = { x: (vw - side) / 2, y: (vh - side) / 2, w: side, h: side, scale: 1, trackId: null };
       } else {
         // With codes in view their module size is known: search at that resolution.
+        // Codes already tracked are blanked out: the probe is there to find new ones.
         const scale = tracks.length ? Math.max(...tracks.map((t) => t.scale)) : 1;
-        crop = { x: 0, y: 0, w: vw, h: vh, scale, trackId: null };
+        crop = { x: 0, y: 0, w: vw, h: vh, scale, trackId: null, mask: tracker.masks() };
       }
       submitCrop(crop, MAX_TRACKS);
       idle--;
     }
     const jobs = tracker.jobs(idle);
     starved += Math.max(0, tracks.length - jobs.length);
-    for (const t of jobs) submitCrop({ ...t.rect, scale: t.scale, trackId: t.id }, 1);
+    // A crop widened after a miss may hold the neighbouring code too: ask for both,
+    // so the tracker can tell which one is this track's.
+    for (const t of jobs) submitCrop({ ...t.rect, scale: t.scale, trackId: t.id }, t.misses > 0 ? 2 : 1);
   }
 
   function submitCrop(crop: Crop, maxSymbols: number): void {
@@ -500,6 +549,12 @@ export function renderReceive(root: HTMLElement): () => void {
     }
     ctx.imageSmoothingEnabled = true;
     ctx.drawImage(video, crop.x, crop.y, crop.w, crop.h, 0, 0, dw, dh);
+    if (crop.mask?.length) {
+      const sx = dw / crop.w;
+      const sy = dh / crop.h;
+      ctx.fillStyle = '#fff';
+      for (const r of crop.mask) ctx.fillRect((r.x - crop.x) * sx, (r.y - crop.y) * sy, r.w * sx, r.h * sy);
+    }
     const image = ctx.getImageData(0, 0, dw, dh);
     // Record the exact factor used after rounding, so coordinates map back precisely.
     crop.scale = dw / crop.w;
@@ -642,7 +697,14 @@ export function renderReceive(root: HTMLElement): () => void {
     const vw = video.videoWidth;
     const vh = video.videoHeight;
     const edge = Math.min(vw, vh) * 0.02;
-    for (const t of tracker.all) {
+    const tracks = tracker.all;
+    // The sender stacks two codes vertically: a landscape camera frame leaves them
+    // small. Only a handheld device can simply be turned.
+    if (tracks.length >= 2 && vw > vh * 1.1 && navigator.maxTouchPoints > 0) {
+      const [a, b] = tracks;
+      if (Math.abs(a.cy - b.cy) > Math.abs(a.cx - b.cx)) return 'Держите телефон вертикально — коды расположены друг над другом';
+    }
+    for (const t of tracks) {
       const half = t.side / 2;
       if (t.cx - half < edge || t.cy - half < edge || t.cx + half > vw - edge || t.cy + half > vh - edge) {
         return 'Код у края кадра — отодвиньте телефон, чтобы все коды целиком были в кадре';
@@ -669,62 +731,101 @@ export function renderReceive(root: HTMLElement): () => void {
 
   /**
    * Advice on the sender's rate for a 60 fps camera. Camera and screen clocks run
-   * at nearly the same rate, so with <= 2 camera frames per code there are long
-   * stretches where every code is caught mid-change: reception stalls at regular
-   * intervals (see worstPhaseCapture in core/limits.ts). 3 frames per code
-   * (20 changes/s on a 60 Hz screen) are safe at any phase.
+   * at nearly the same rate, so at some rates there are long stretches where every
+   * code is caught mid-change: reception stalls at regular intervals (see
+   * stallRisk and worstPhaseCapture in core/limits.ts). Which rates are safe
+   * depends on the sender's screen, which "⚡ Авто" on the sender measures.
    */
+  const riskMemo = new Map<string, ReturnType<typeof stallRisk>>();
+
   function senderRateHint(camFps: number, now: number): string {
     const s = status;
     if (!s || s.completedAt || s.received < 20) return '';
     const rate = senderChangesPerSecond(now);
     if (rate <= 0) return '';
-    const framesPerCode = camFps / rate;
-    if (framesPerCode < 2.6) {
-      return `Отправитель меняет коды ${Math.round(rate)} раз/с — камера успевает снять каждый всего ${framesPerCode.toFixed(1)} раза, и приём будет периодически замирать. Поставьте на отправителе 20 смен/с`;
+    // Runs every animation frame: the model is evaluated once per (rounded) rate.
+    const key = `${Math.round(rate * 2)}:${Math.round(camFps / 5)}`;
+    let risk = riskMemo.get(key);
+    if (!risk) {
+      risk = stallRisk(Math.round(rate * 2) / 2, Math.round(camFps / 5) * 5);
+      if (riskMemo.size > 200) riskMemo.clear();
+      riskMemo.set(key, risk);
     }
-    if (framesPerCode > 3.6) return 'Камера снимает 60 к/с — на отправителе можно поставить до 20 смен кода в секунду';
+    const shown = `Отправитель меняет коды ${Math.round(rate)} раз/с`;
+    if (risk === 'sure') return `${shown} — камера ловит коды на смене кадра, и приём будет периодически замирать. Включите на отправителе режим «⚡ Авто»`;
+    if (risk === 'if60') return `${shown} — если у отправителя обычный экран 60 Гц, приём будет периодически замирать. Включите на отправителе режим «⚡ Авто»`;
+    if (camFps / rate > 3.6) return 'Камера снимает 60 к/с — отправитель может менять коды быстрее: режим «⚡ Авто» подберёт скорость под его экран';
     return '';
   }
 
   // ---- completion --------------------------------------------------------------
+  /** Object URLs of the shown files (revoked when the result goes away). */
+  let resultUrls: string[] = [];
+  const unpacking = new AbortController();
+
+  function releaseResult(): void {
+    for (const url of resultUrls) URL.revokeObjectURL(url);
+    resultUrls = [];
+    clear(result);
+  }
+
   async function finish(s: ReceiverStatus, data: Uint8Array): Promise<void> {
     if (completeShown) return;
     completeShown = true;
+    cameraGen++; // a camera start still in progress must not reopen it
     stopCamera();
     placeholder.style.display = '';
     placeholder.textContent = 'Приём завершён';
-    clear(result);
+    releaseResult();
     const unpackNote = h('div', { class: 'card small' }, 'Распаковка…');
     result.appendChild(unpackNote);
     const t0 = performance.now();
     let files: FileEntry[];
     let method: Method;
     try {
-      const r = await unpackInWorker(data, (p) => {
-        unpackNote.textContent = p.phase === 'cm' ? `Распаковка (контекстное смешивание): ${Math.round((p.done / Math.max(1, p.total)) * 100)}%` : 'Распаковка…';
-      });
+      const r = await unpackInWorker(
+        data,
+        (p) => {
+          unpackNote.textContent = p.phase === 'cm' ? `Распаковка (контекстное смешивание): ${Math.round((p.done / Math.max(1, p.total)) * 100)}%` : 'Распаковка…';
+        },
+        unpacking.signal,
+      );
       files = r.files;
       method = r.method;
     } catch (err) {
+      if (destroyed) return;
       clear(result);
       result.appendChild(h('div', { class: 'card note err' }, `Данные собраны, но повреждены: ${err instanceof Error ? err.message : String(err)}`, h('div', { style: 'margin-top:8px' }, againButton())));
       return;
     }
+    if (destroyed) return; // stored frames stay: the files are unpacked again next time
+    post({ type: 'delivered', transferId: s.transferId });
     clear(result);
     const unpackSecs = (performance.now() - t0) / 1000;
     const seconds = Math.max(0.001, ((s.completedAt ?? performance.now()) - s.startedAt) / 1000 + unpackSecs);
     const totalSize = files.reduce((sum, f) => sum + f.data.length, 0);
     const blobs = files.map((f) => new Blob([f.data as BlobPart], { type: f.mime }));
     const urls = blobs.map((b) => URL.createObjectURL(b));
+    resultUrls = urls.slice();
     const baseName = (name: string): string => name.split('/').pop() || name;
     const actions = h('div', { class: 'row', style: 'justify-content:center;margin-top:12px' });
 
     if (files.length === 1) {
       actions.appendChild(h('a', { class: 'button primary', href: urls[0], download: baseName(files[0].name) }, '💾 Сохранить'));
     } else {
-      const zipUrl = URL.createObjectURL(new Blob([createZip(files) as BlobPart], { type: 'application/zip' }));
-      actions.appendChild(h('a', { class: 'button primary', href: zipUrl, download: 'qr-air-files.zip' }, '🗜 Сохранить всё (.zip)'));
+      // Built on the first tap: an archive the size of all files is not needed to show them.
+      let zipUrl = '';
+      const saveZip = (): void => {
+        if (!zipUrl) {
+          zipUrl = URL.createObjectURL(new Blob([createZip(files) as BlobPart], { type: 'application/zip' }));
+          resultUrls.push(zipUrl);
+        }
+        const link = h('a', { href: zipUrl, download: 'qr-air-files.zip', style: 'display:none' });
+        document.body.appendChild(link); // some browsers ignore clicks on detached links
+        link.click();
+        link.remove();
+      };
+      actions.appendChild(h('button', { class: 'primary', onclick: saveZip }, '🗜 Сохранить всё (.zip)'));
     }
     const shareFiles = files.map((f, i) => new File([blobs[i]], baseName(f.name), { type: f.mime }));
     if (navigator.canShare?.({ files: shareFiles })) {
@@ -769,7 +870,7 @@ export function renderReceive(root: HTMLElement): () => void {
   function againButton(): HTMLButtonElement {
     return h('button', {
       onclick: () => {
-        clear(result);
+        releaseResult();
         post({ type: 'reset' });
         status = null;
         lastRank = 0;
@@ -789,9 +890,16 @@ export function renderReceive(root: HTMLElement): () => void {
 
   return () => {
     destroyed = true;
+    cameraGen++;
+    unpacking.abort();
+    document.removeEventListener('visibilitychange', onHidden);
     cancelAnimationFrame(uiRaf);
     stopCamera();
     pool.destroy();
-    receiver.terminate();
+    // Leaving the page: the worker stores pending frames, then closes itself
+    // (terminated anyway if storage hangs).
+    post({ type: 'close' });
+    setTimeout(() => receiver.terminate(), 3000);
+    releaseResult();
   };
 }

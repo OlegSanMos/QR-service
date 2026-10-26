@@ -1,5 +1,6 @@
-// A second fake-camera clip: the sender shows two codes side by side (like the
-// "2 кода на экране" mode: quiet zones plus a 4-module gap) and changes them
+// A second fake-camera clip: the sender shows two codes stacked vertically (like
+// the 2-code mode: quiet zones plus a 4-module gap), filmed by a phone held in
+// portrait (360×640), and changes them
 // 30 times a second, filmed at 60 fps. Every 7th code is missing to exercise
 // fountain recovery.
 
@@ -9,8 +10,8 @@ import { Prng } from '../src/core/prng';
 import { TransferEncoder } from '../src/core/transfer';
 import { MULTI_CAMERA_SOURCE, MULTI_CAMERA_VIDEO } from './paths';
 
-const W = 640;
-const H = 360;
+const W = 360;
+const H = 640;
 const CODES = 2;
 const PPM = 3;
 
@@ -32,8 +33,8 @@ export async function makeMultiCodeClip(): Promise<void> {
       const { size, modules } = enc.matrix(id);
       const total = (size + 8) * PPM;
       const gap = 4 * PPM; // the sender leaves 4 extra modules between codes
-      const ox = Math.floor((W - total * CODES - gap * (CODES - 1)) / 2) + c * (total + gap);
-      const oy = Math.floor((H - total) / 2);
+      const ox = Math.floor((W - total) / 2);
+      const oy = Math.floor((H - total * CODES - gap * (CODES - 1)) / 2) + c * (total + gap);
       for (let py = 0; py < total; py++) {
         for (let px = 0; px < total; px++) {
           const mx = Math.floor(px / PPM) - 4;

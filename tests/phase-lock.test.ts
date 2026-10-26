@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { DEFAULT_CHANNEL, captureProbability, worstPhaseCapture } from '../src/core/limits';
+import { COMMON_PANELS, DEFAULT_CHANNEL, autoDisplayFps, captureProbability, stallRisk, worstPhaseCapture } from '../src/core/limits';
 import { peekSymbolId } from '../src/core/protocol';
 import { TransferEncoder } from '../src/core/transfer';
 
@@ -39,5 +39,20 @@ describe('sender rate seen by the receiver', () => {
     expect(peekSymbolId(enc.frame(0))).toBe(0);
     expect(peekSymbolId(enc.frame(123456))).toBe(123456);
     expect(peekSymbolId(new TextEncoder().encode('https://example.com/some/long/link'))).toBeNull();
+  });
+});
+
+describe('receiver advice without knowing the sender screen', () => {
+  it('flags only rates that stall a 60 fps camera', () => {
+    // What "⚡ Авто" picks is never flagged for sure; only 240 Hz (30/s) looks
+    // like a 60 Hz panel at 2 refreshes per code, so the advice stays conditional.
+    for (const hz of COMMON_PANELS) expect(stallRisk(autoDisplayFps(hz), 60)).toBe(hz === 240 ? 'if60' : 'none');
+    // 30/s stalls only on a 60 Hz panel; ≥ 36/s on every panel that can show it.
+    expect(stallRisk(30, 60)).toBe('if60');
+    expect(stallRisk(60, 60)).toBe('sure');
+    expect(stallRisk(40, 60)).toBe('sure');
+    expect(stallRisk(37.5, 60)).toBe('sure');
+    expect(stallRisk(20, 60)).toBe('none');
+    expect(stallRisk(15, 60)).toBe('none');
   });
 });

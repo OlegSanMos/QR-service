@@ -22,8 +22,14 @@ self.onmessage = async (e: MessageEvent<CodecRequest>) => {
   const msg = e.data;
   try {
     if (msg.type === 'pack') {
-      const r = await packFiles(msg.files, { method: msg.method, linkBytesPerSecond: msg.linkBytesPerSecond, onProgress: progress(msg.id) });
-      post({ type: 'packed', id: msg.id, stream: r.stream, method: r.method, totalSize: r.totalSize, candidates: r.candidates }, [r.stream.buffer]);
+      const remembered = msg.remembered ?? {};
+      const r = await packFiles(msg.files, {
+        method: msg.method,
+        linkBytesPerSecond: msg.linkBytesPerSecond,
+        onProgress: progress(msg.id),
+        rememberedMethod: (key) => (Object.hasOwn(remembered, key) ? remembered[key] : undefined),
+      });
+      post({ type: 'packed', id: msg.id, stream: r.stream, method: r.method, totalSize: r.totalSize, candidates: r.candidates, key: r.key }, [r.stream.buffer]);
     } else {
       const r = await unpackContainer(msg.stream, progress(msg.id));
       // Each file is a view into one buffer; copy so every file can be transferred on its own.

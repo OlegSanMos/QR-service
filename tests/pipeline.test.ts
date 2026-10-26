@@ -66,4 +66,21 @@ describe('end-to-end: file → QR frames → camera → file', () => {
     expect(rx.ingest(new TextEncoder().encode('WIFI:S:home;T:WPA;P:secret;;'), 0).kind).toBe('foreign');
     expect(rx.status).toBeNull();
   });
+
+  it('shows the file list of a large folder before the transfer ends', async () => {
+    // 7000 files: the archive header alone spans hundreds of blocks.
+    const files = Array.from({ length: 7000 }, (_, i) => ({ name: `folder/sub/file-${i}.txt`, mime: 'text/plain', data: new Uint8Array(100).fill(i & 255) }));
+    const packed = await packFiles(files, { method: 'store' });
+    const enc = new TransferEncoder(packed.stream, { version: 25, ecc: 'L' });
+    const rx = new TransferReceiver();
+    let knownAt = -1;
+    for (let id = 0; !rx.complete; id++) {
+      rx.ingest(enc.frame(id), id);
+      if (knownAt < 0 && rx.status?.info) knownAt = id;
+    }
+    expect(knownAt).toBeGreaterThan(0);
+    expect(knownAt).toBeLessThan(enc.K * 0.75);
+    expect(rx.status!.info!.files.length).toBe(7000);
+    expect(rx.status!.info!.files[6999].name).toBe('folder/sub/file-6999.txt');
+  });
 });

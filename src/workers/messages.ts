@@ -51,7 +51,13 @@ export type ReceiverRequest =
   /** "Принять ещё": stored frames are deleted only if the current transfer is complete. */
   | { type: 'reset' }
   /** "Начать заново": deletes a stored transfer and drops it if it is the current one. */
-  | { type: 'discard'; transferId: number };
+  | { type: 'discard'; transferId: number }
+  /** The completed stream was unpacked and shown: its stored frames are no longer needed. */
+  | { type: 'delivered'; transferId: number }
+  /** The page is going to the background (and may be killed there): store pending frames now. */
+  | { type: 'flush' }
+  /** The page is closing: store pending frames, then stop. */
+  | { type: 'close' };
 
 export type ReceiverResponse =
   | { type: 'status'; status: ReceiverStatus | null; framesAccepted: number; lastKind: IngestKind | null; started: boolean }
@@ -68,6 +74,8 @@ export type CodecRequest =
       files: { name: string; mime: string; data: Uint8Array }[];
       method: 'auto' | 'store' | 'deflate' | 'cm';
       linkBytesPerSecond: number;
+      /** Methods 'auto' chose for earlier content, by `PackResult.key`. */
+      remembered?: Record<string, 'store' | 'deflate' | 'cm'>;
     }
   | { type: 'unpack'; id: number; stream: Uint8Array };
 
@@ -80,6 +88,7 @@ export type CodecResponse =
       method: 'store' | 'deflate' | 'cm';
       totalSize: number;
       candidates: { method: string; size: number; ms: number; cost: number; aborted?: boolean }[];
+      key: string;
     }
   | { type: 'unpacked'; id: number; files: { name: string; mime: string; data: Uint8Array }[]; method: 'store' | 'deflate' | 'cm' }
   | { type: 'error'; id: number; message: string };

@@ -110,6 +110,9 @@ interface Session {
   lastProgressAt: number;
   completedAt: number | null;
   info: ContainerInfo | null;
+  /** Leading blocks known so far, and how many stream bytes the last header peek examined. */
+  prefixBlocks: number;
+  peekedBytes: number;
 }
 
 /** A transfer we have seen once; it is only allocated after a second consistent frame. */
@@ -119,8 +122,14 @@ interface Candidate {
   seenAt: number;
 }
 
-/** How much of the stream start is examined for the archive header (file list). */
-const MAX_HEADER_PEEK = 256 * 1024;
+/**
+ * How much of the stream start is examined for the archive header (file list):
+ * tens of thousands of files with long paths. Past that the list is simply not
+ * shown until the transfer completes.
+ */
+const MAX_HEADER_PEEK = 8 * 1024 * 1024;
+/** A header that did not fit is parsed again only once this much more of it has arrived. */
+const PEEK_GROWTH = 1.25;
 
 /** After this long without frames from the current transfer, a new one may take over. */
 const SWITCH_AFTER_MS = 2500;
@@ -170,6 +179,8 @@ export class TransferReceiver {
         lastProgressAt: now,
         completedAt: null,
         info: null,
+        prefixBlocks: 0,
+        peekedBytes: 0,
       };
       this.session = session;
       this.feed(session, c.frame, now);
@@ -191,23 +202,20 @@ export class TransferReceiver {
   }
 
   private peekInfo(s: Session): ContainerInfo | null {
-    const parts: Uint8Array[] = [];
-    let len = 0;
-    // The archive header lists every file, so it may span several blocks.
-    for (let b = 0; b < s.decoder.K && len < MAX_HEADER_PEEK; b++) {
-      const block = s.decoder.getBlock(b);
-      if (!block) break;
-      parts.push(block);
-      len += block.length;
-    }
-    if (len === 0) return null;
-    const head = new Uint8Array(len);
-    let off = 0;
-    for (const p of parts) {
-      head.set(p, off);
-      off += p.length;
-    }
-    return peekContainerInfo(head.subarray(0, Math.min(len, s.header.totalLength)));
+    // The archive header lists every file, so it may span many blocks; only the
+    // known prefix of the stream can be parsed.
+    let n = s.prefixBlocks;
+    while (n < s.decoder.K && s.decoder.hasBlock(n)) n++;
+    s.prefixBlocks = n;
+    const limit = Math.min(s.header.totalLength, MAX_HEADER_PEEK);
+    const len = Math.min(n * s.header.blockSize, limit);
+    // Parsing starts from scratch each time: with thousands of files, wait until
+    // noticeably more of the header is there instead of re-parsing every frame.
+    if (len <= s.peekedBytes || (len < s.peekedBytes * PEEK_GROWTH && len < limit)) return null;
+    s.peekedBytes = len;
+    const head = new Uint8Array(Math.ceil(len / s.header.blockSize) * s.header.blockSize);
+    for (let b = 0; b * s.header.blockSize < len; b++) head.set(s.decoder.getBlock(b)!, b * s.header.blockSize);
+    return peekContainerInfo(head.subarray(0, len));
   }
 
   get status(): ReceiverStatus | null {

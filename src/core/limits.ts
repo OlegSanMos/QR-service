@@ -146,6 +146,30 @@ export function worstPhaseCapture(p: ChannelParams, codes = 600, phases = 240): 
   return worst;
 }
 
+/** Refresh rates of common screens (Hz). */
+export const COMMON_PANELS = [60, 75, 90, 100, 120, 144, 165, 240];
+
+/**
+ * Whether a camera at `cameraFps` risks periodic stalls on a sender that changes
+ * codes `rate` times a second, when the receiver does not know the sender's
+ * screen. A player shows each code for a whole number of refreshes, so the rate
+ * tells which panels are possible (rate ≈ R/k). 'sure': stalls on every such
+ * panel; 'if60': only on a 60 Hz one (30/s is fine on 90-240 Hz panels);
+ * 'none' otherwise.
+ */
+export function stallRisk(rate: number, cameraFps: number, shutterMs = 10): 'none' | 'if60' | 'sure' {
+  if (!(rate > 0)) return 'none';
+  const bad = (R: number): boolean => worstPhaseCapture({ ...DEFAULT_CHANNEL, refreshHz: R, displayFps: R / Math.round(R / rate), cameraFps, shutterMs }, 300, 120) < 0.75;
+  const panels = COMMON_PANELS.filter((R) => {
+    const k = Math.round(R / rate);
+    return k >= 1 && Math.abs(R / k - rate) <= rate * 0.04;
+  });
+  if (panels.length === 0) return 'none';
+  const risky = panels.filter(bad);
+  if (risky.length === panels.length) return 'sure';
+  return risky.includes(60) ? 'if60' : 'none';
+}
+
 /** Camera pixels per module needed for reliable detection (Nyquist ×2 plus margin for blur/perspective). */
 export const MIN_PIXELS_PER_MODULE = 3;
 

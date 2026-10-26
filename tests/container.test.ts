@@ -64,6 +64,29 @@ describe('container v2', () => {
     expect(r.candidates.find((c) => c.method === 'cm')?.aborted).toBe(true);
   });
 
+  it('auto: a remembered choice gives the same stream however slow the CPU is now', async () => {
+    // First run: CM pays off on a slow link. Second run: CM looks hopeless on this
+    // (fake) clock and would lose to deflate, but the remembered choice wins, so a
+    // restarted sender produces the same stream and transfer id.
+    const big = new Uint8Array(text.length * 30);
+    for (let i = 0; i < 30; i++) big.set(text, i * text.length);
+    const files = [{ name: 'big.txt', mime: 'text/plain', data: big }];
+    const first = await packFiles(files, { linkBytesPerSecond: 2_000, now: () => 0 }); // a fast CPU
+    expect(first.method).toBe('cm');
+    let calls = 0;
+    const slow = (): number => (++calls <= 2 ? 0 : (calls - 2) * 1000);
+    const fresh = await packFiles(files, { linkBytesPerSecond: 50_000_000, now: slow });
+    expect(fresh.method).toBe('deflate');
+    expect(fresh.key).toBe(first.key); // the key names the content, not the method
+    calls = 0;
+    const again = await packFiles(files, { linkBytesPerSecond: 50_000_000, now: slow, rememberedMethod: (k) => (k === first.key ? first.method : undefined) });
+    expect(again.method).toBe('cm');
+    expect(Buffer.from(again.stream).equals(Buffer.from(first.stream))).toBe(true);
+    // Other content (here: another name) is not affected.
+    const other = await packFiles([{ ...files[0], name: 'other.txt' }], { method: 'store' });
+    expect(other.key).not.toBe(first.key);
+  });
+
   it('detects corruption', async () => {
     const r = await packFiles([{ name: 'a.txt', mime: 'text/plain', data: text }], { method: 'store' });
     r.stream[r.stream.length - 1] ^= 1;

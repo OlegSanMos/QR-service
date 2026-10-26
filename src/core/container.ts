@@ -71,6 +71,13 @@ export interface PackOptions {
   onProgress?: (p: PackProgress) => void;
   /** Clock in ms (tests inject a fake one). */
   now?: () => number;
+  /**
+   * Method that 'auto' chose for the same content before (see `PackResult.key`).
+   * The choice depends on measured speed, and a different method means a
+   * different stream and transfer id: a restarted sender must reuse it so the
+   * receiver can continue the transfer it already has half of.
+   */
+  rememberedMethod?: (key: string) => Method | undefined;
 }
 
 export interface Candidate {
@@ -87,6 +94,8 @@ export interface PackResult {
   method: Method;
   totalSize: number;
   candidates: Candidate[];
+  /** Identifies the content (files, names, types), independent of the method. */
+  key: string;
 }
 
 export interface UnpackResult {
@@ -167,9 +176,12 @@ export async function packFiles(files: FileEntry[], options: PackOptions = {}): 
   const now = options.now ?? (() => performance.now());
   const link = options.linkBytesPerSecond ?? 20_000;
   const slowdown = options.receiverSlowdown ?? 1.5;
-  const want = options.method ?? 'auto';
   const raw = concat(files);
   if (raw.length > MAX_TOTAL_LENGTH) throw new RangeError('files are larger than 4 GiB in total');
+  const key = contentKey(files, raw);
+  const requested = options.method ?? 'auto';
+  const remembered = requested === 'auto' ? options.rememberedMethod?.(key) : undefined;
+  const want = remembered !== undefined && remembered in METHOD_IDS ? remembered : requested;
 
   const cost = (size: number, ms: number, method: Method): number => {
     const decodeMs = method === 'cm' ? ms * slowdown : 0;
@@ -189,8 +201,11 @@ export async function packFiles(files: FileEntry[], options: PackOptions = {}): 
   }
 
   // Context mixing only where data is compressible at all (deflate saved ≥ 3 %).
-  const deflateSize = payloads.get('deflate')?.length ?? raw.length;
-  const tryCm = want === 'cm' || (want === 'auto' && raw.length >= 64 && raw.length <= CM_MAX_BYTES && deflateSize < raw.length * 0.97);
+  // Without deflate (Safari < 16.4) that is unknown: CM itself gives up early on
+  // data it cannot shrink enough (see the projection below).
+  const deflated = payloads.get('deflate');
+  const compressible = deflated ? deflated.length < raw.length * 0.97 : true;
+  const tryCm = want === 'cm' || (want === 'auto' && raw.length >= 64 && raw.length <= CM_MAX_BYTES && compressible);
   if (tryCm) {
     const best = Math.min(...candidates.map((c) => c.cost));
     const t0 = now();
@@ -226,7 +241,13 @@ export async function packFiles(files: FileEntry[], options: PackOptions = {}): 
   const stream = new Uint8Array(head.length + payload.length);
   stream.set(head);
   stream.set(payload, head.length);
-  return { stream, method: chosen.method, totalSize: raw.length, candidates };
+  return { stream, method: chosen.method, totalSize: raw.length, candidates, key };
+}
+
+function contentKey(files: FileEntry[], raw: Uint8Array): string {
+  const head = encodeHeader(files, 'store', raw);
+  // Bytes 6..9 of the header already hold the CRC-32 of the data.
+  return `${crc32(head).toString(16)}-${raw.length.toString(16)}`;
 }
 
 /** Reads the metadata from the beginning of a (possibly partial) stream, or null if incomplete. */
