@@ -45,6 +45,44 @@ export function roiAround(codes: LocatedCode[], frameW: number, frameH: number, 
   return { x: x0, y: y0, w: x1 - x0, h: y1 - y0 };
 }
 
+/**
+ * Region to decode next, given the previous one and the box around the codes just
+ * found. The detected corners jitter by a pixel or two from frame to frame, and a
+ * region that changes size every frame makes the receiver reallocate its capture
+ * canvas and a differently sized ImageData each time (measured: on half of all
+ * frames at v40). So the previous region is kept while it still contains the new
+ * one and is not much larger; a new region gets a little slack around it.
+ */
+export function holdRoi(prev: Rect | null, next: Rect, frameW: number, frameH: number, slack = 0.03, maxGrowth = 1.25): Rect {
+  if (
+    prev &&
+    prev.x <= next.x &&
+    prev.y <= next.y &&
+    prev.x + prev.w >= next.x + next.w &&
+    prev.y + prev.h >= next.y + next.h &&
+    prev.w * prev.h <= next.w * next.h * maxGrowth
+  ) {
+    return prev;
+  }
+  const px = Math.ceil(next.w * slack);
+  const py = Math.ceil(next.h * slack);
+  const x0 = Math.max(0, next.x - px);
+  const y0 = Math.max(0, next.y - py);
+  const x1 = Math.min(frameW, next.x + next.w + px);
+  const y1 = Math.min(frameH, next.y + next.h + py);
+  return { x: x0, y: y0, w: x1 - x0, h: y1 - y0 };
+}
+
+/**
+ * Downscale factor to use next: like `holdRoi`, it only changes when the needed
+ * factor leaves a band around the current one, and new values are rounded up to
+ * a 1/16 step (never fewer pixels per module than `downscaleFor` asked for).
+ */
+export function holdScale(prev: number, next: number, band = 0.93): number {
+  if (next <= prev && next >= prev * band) return prev;
+  return Math.min(1, Math.ceil(next * 16 - 1e-9) / 16);
+}
+
 /** Camera pixels per QR module, from the detected corners and the symbol version. */
 export function pixelsPerModule(code: LocatedCode): number | null {
   if (code.version < 1 || code.version > 40) return null;

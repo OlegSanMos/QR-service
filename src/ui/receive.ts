@@ -1,5 +1,6 @@
 import { unpackContainer, type UnpackedContainer } from '../core/container';
-import { downscaleFor, roiAround, type LocatedCode, type Rect } from '../core/roi';
+import { peekSymbolId } from '../core/protocol';
+import { downscaleFor, holdRoi, holdScale, roiAround, type LocatedCode, type Rect } from '../core/roi';
 import type { ReceiverStatus } from '../core/transfer';
 import type { DecodeRequest, DecodeResponse, DetectedQuad, ReceiverRequest, ReceiverResponse } from '../workers/messages';
 import { ScreenWakeLock, clear, formatBytes, formatDuration, formatRate, h } from './dom';
@@ -159,8 +160,12 @@ export function renderReceive(root: HTMLElement): () => void {
   const pool = new DecoderPool(defaultPoolSize());
   const receiver = new Worker(new URL('../workers/receiver.worker.ts', import.meta.url), { type: 'module' });
   const wakeLock = new ScreenWakeLock();
-  const capture = document.createElement('canvas');
-  const captureCtx = capture.getContext('2d', { willReadFrequently: true })!;
+  // Tracked regions and full-frame searches get a canvas each, so the periodic
+  // probes do not resize the tracking canvas back and forth (see holdRoi).
+  const captures = [0, 1].map(() => {
+    const canvas = document.createElement('canvas');
+    return { canvas, ctx: canvas.getContext('2d', { willReadFrequently: true })! };
+  });
   let stream: MediaStream | null = null;
   let running = false;
   let destroyed = false;
@@ -169,6 +174,8 @@ export function renderReceive(root: HTMLElement): () => void {
   let lastForeignAt = 0;
   let quads: { q: DetectedQuad; at: number }[] = [];
   let recentMax: number[] = [];
+  /** [time, symbol id] of recently decoded codes, to measure how fast the sender changes codes. */
+  let idTrail: [number, number][] = [];
   let frameCounter = 0;
   let dropped = 0;
   let decodeMs = 0;
@@ -208,6 +215,11 @@ export function renderReceive(root: HTMLElement): () => void {
     if (recentMax.length > 30) recentMax.shift();
     if (codes.length) {
       codeRate.add(now, codes.length);
+      for (const c of codes) {
+        const id = peekSymbolId(c);
+        if (id !== null) idTrail.push([now, id]);
+      }
+      idTrail = idTrail.filter(([t]) => now - t < 3000);
       if (running) post({ type: 'codes', codes, now });
     }
   };
@@ -217,8 +229,11 @@ export function renderReceive(root: HTMLElement): () => void {
     const vw = video.videoWidth;
     const vh = video.videoHeight;
     if (found.length > 0) {
-      roi = roiAround(found, vw, vh);
-      roiScale = downscaleFor(found);
+      // Keep the region and its scale while the code stays inside: a capture size that
+      // changes every frame reallocates the canvas and the ImageData each time.
+      const next = roiAround(found, vw, vh);
+      roi = next && holdRoi(roi, next, vw, vh);
+      roiScale = holdScale(roiScale, downscaleFor(found));
       roiMisses = 0;
     } else if (roi && crop.tracked) {
       // A miss inside the ROI: maybe too blurry for the downscale — use more pixels,
@@ -235,6 +250,7 @@ export function renderReceive(root: HTMLElement): () => void {
       if (msg.lastKind === 'foreign') lastForeignAt = now;
       if (msg.started) {
         lastRank = 0;
+        idTrail = [];
         completeShown = false;
         clear(result);
       }
@@ -416,6 +432,7 @@ export function renderReceive(root: HTMLElement): () => void {
     }
     const dw = Math.max(1, Math.round(crop.w * crop.scale));
     const dh = Math.max(1, Math.round(crop.h * crop.scale));
+    const { canvas: capture, ctx: captureCtx } = captures[crop.tracked ? 0 : 1];
     if (capture.width !== dw || capture.height !== dh) {
       capture.width = dw;
       capture.height = dh;
@@ -512,8 +529,8 @@ export function renderReceive(root: HTMLElement): () => void {
     setStat('Кодов прочитано', `${codesPs.toFixed(1)}/с`);
     setStat('Пропущено кадров', String(dropped));
     setStat('Область', running ? (roi ? `слежение · ${Math.round(Math.sqrt(lastCropPixels))}² пикс.` : 'весь кадр') : '—');
-    const faster = running && camFps >= 45 ? fasterSenderHint() : '';
-    if (faster) hint.textContent = faster;
+    const advice = running && camFps >= 45 ? senderRateHint(camFps, now) : '';
+    if (advice) hint.textContent = advice;
     if (!status) return;
     const s = status;
     const pct = (s.rank / s.K) * 100;
@@ -550,11 +567,39 @@ export function renderReceive(root: HTMLElement): () => void {
     }
   }
 
-  /** With a 60 fps camera the sender can change codes up to ~30 times a second. */
-  function fasterSenderHint(): string {
+  /** Code changes per second on the sender, from the symbol ids decoded in the last seconds. */
+  function senderChangesPerSecond(now: number): number {
+    let lo: [number, number] | null = null;
+    let hi: [number, number] | null = null;
+    for (const e of idTrail) {
+      if (now - e[0] > 3000) continue;
+      if (!lo || e[1] < lo[1]) lo = e;
+      if (!hi || e[1] > hi[1]) hi = e;
+    }
+    if (!lo || !hi || hi[0] - lo[0] < 1000 || hi[1] - lo[1] > 100_000) return 0;
+    // Ids are dealt to the codes on screen in turn: one change shows `codes` new ids.
+    const codesOnScreen = Math.max(1, ...recentMax);
+    return ((hi[1] - lo[1]) * 1000) / (hi[0] - lo[0]) / codesOnScreen;
+  }
+
+  /**
+   * Advice on the sender's rate for a 60 fps camera. Camera and screen clocks run
+   * at nearly the same rate, so with <= 2 camera frames per code there are long
+   * stretches where every code is caught mid-change: reception stalls at regular
+   * intervals (see worstPhaseCapture in core/limits.ts). 3 frames per code
+   * (20 changes/s on a 60 Hz screen) are safe at any phase.
+   */
+  function senderRateHint(camFps: number, now: number): string {
     const s = status;
     if (!s || s.completedAt || s.received < 20) return '';
-    return s.duplicates > s.received * 1.5 ? 'Камера снимает 60 к/с — на отправителе можно поставить до 30 смен кода в секунду' : '';
+    const rate = senderChangesPerSecond(now);
+    if (rate <= 0) return '';
+    const framesPerCode = camFps / rate;
+    if (framesPerCode < 2.6) {
+      return `Отправитель меняет коды ${Math.round(rate)} раз/с — камера успевает снять каждый всего ${framesPerCode.toFixed(1)} раза, и приём будет периодически замирать. Поставьте на отправителе 20 смен/с`;
+    }
+    if (framesPerCode > 3.6) return 'Камера снимает 60 к/с — на отправителе можно поставить до 20 смен кода в секунду';
+    return '';
   }
 
   // ---- completion --------------------------------------------------------------

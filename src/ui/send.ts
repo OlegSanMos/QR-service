@@ -1,6 +1,6 @@
 import { packContainer } from '../core/container';
 import { blockCount } from '../core/fountain/layout';
-import { DEFAULT_CHANNEL, estimateThroughput } from '../core/limits';
+import { DEFAULT_CHANNEL, estimateThroughput, worstPhaseCapture } from '../core/limits';
 import { MAX_VERSION, type Ecc } from '../core/qr/tables';
 import { blockSizeFor, randomTransferId } from '../core/transfer';
 import type { EncodeRequest, EncodeResponse, RenderedFrame } from '../workers/messages';
@@ -20,8 +20,8 @@ const PRESETS: { label: string; hint: string; s: Omit<SendSettings, 'compress'> 
   { label: 'Надёжно', hint: 'старые телефоны, плохой свет', s: { version: 14, ecc: 'M', fps: 7.5, codes: 1 } },
   { label: 'Баланс', hint: 'большинство телефонов', s: { version: 22, ecc: 'L', fps: 12, codes: 1 } },
   { label: 'Быстро', hint: 'камера 30 к/с, телефон на подставке', s: { version: 30, ecc: 'L', fps: 15, codes: 1 } },
-  { label: '60 к/с', hint: 'камера получателя 60 к/с (выберите в настройках приёма)', s: { version: 25, ecc: 'L', fps: 30, codes: 1 } },
-  { label: 'Максимум', hint: 'экран ноутбука → камера 60 к/с, подставка', s: { version: 30, ecc: 'L', fps: 30, codes: 2 } },
+  { label: '60 к/с', hint: 'камера получателя 60 к/с (выберите в настройках приёма)', s: { version: 25, ecc: 'L', fps: 20, codes: 1 } },
+  { label: 'Максимум', hint: 'экран ноутбука → камера 60 к/с, подставка', s: { version: 30, ecc: 'L', fps: 20, codes: 2 } },
 ];
 
 const STORAGE_KEY = 'qr-air.send-settings';
@@ -171,6 +171,8 @@ export function renderSend(root: HTMLElement): () => void {
       summary.append(stat('Время ≈ (30 к/с)', formatDuration(t)));
       if (t > 30 * 60) warn.appendChild(h('div', { class: 'note', style: 'margin-top:10px' }, `Передача займёт около ${formatDuration(t)}. Закрепите устройства (штатив/подставка) и отключите автоблокировку экрана.`));
     }
+    const stallWarning = phaseLockWarning(settings.fps, DEFAULT_CHANNEL.refreshHz);
+    if (stallWarning) warn.appendChild(h('div', { class: 'note', style: 'margin-top:10px' }, stallWarning));
     if (settings.version >= 33 && settings.codes > 1)
       warn.appendChild(h('div', { class: 'note', style: 'margin-top:10px' }, 'Несколько крупных кодов требуют большого экрана отправителя и камеры 1080p+ у получателя.'));
   }
@@ -226,6 +228,18 @@ export function renderSend(root: HTMLElement): () => void {
   syncControls();
 
   return () => player?.destroy();
+}
+
+/**
+ * Warns when a 60 fps camera gets too few frames per code: camera and screen run at
+ * nearly the same rate, so their phase drifts only slowly, and at a bad phase no
+ * code is captured cleanly for tens of seconds — repeatedly, at equal intervals.
+ */
+function phaseLockWarning(fps: number, refreshHz: number): string {
+  const worst = worstPhaseCapture({ ...DEFAULT_CHANNEL, refreshHz, displayFps: fps, cameraFps: 60, shutterMs: 10 });
+  if (worst >= 0.5) return '';
+  const frames = Number((60 / fps).toFixed(1));
+  return `При ${fps} сменах/с на каждый код приходится всего ${frames} кадр${frames === 1 ? '' : 'а'} камеры 60 к/с: частоты экрана и камеры почти равны, и приём будет периодически замирать на десятки секунд. Для камеры 60 к/с ставьте не больше 20 смен/с.`;
 }
 
 // ---------------------------------------------------------------------------

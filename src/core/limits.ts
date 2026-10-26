@@ -109,6 +109,43 @@ export function estimateThroughput(version: number, ecc: Ecc, codesPerScreen: nu
   };
 }
 
+/**
+ * Share of codes that get at least one clean camera frame at the WORST phase
+ * between camera and screen (1 = every phase is fine).
+ *
+ * The random-phase model above is only right on average. A 60 fps camera and a
+ * 60 Hz panel (or 30 fps and 60 Hz) run from independent clocks at the same
+ * nominal rate, so their phase does not jump around — it drifts by a fraction of
+ * a millisecond per second. When a code lasts a whole number of camera frames,
+ * every code is then sampled at the same offset: if the clean window
+ * T_d − t_s − τ is shorter than T_c, a band of phases misses EVERY code, and
+ * reception stops until the drift carries the phase out of that band. It comes
+ * back with the beat period 1/|f_c − k·f_r| (tens of seconds to minutes), i.e.
+ * the transfer stalls repeatedly at equal intervals.
+ */
+export function worstPhaseCapture(p: ChannelParams, codes = 600, phases = 240): number {
+  const Tr = 1000 / p.refreshHz;
+  const Td = 1000 / Math.min(p.displayFps, p.refreshHz);
+  const Tc = 1000 / p.cameraFps;
+  const ts = p.scanFraction * Tr;
+  const tau = p.shutterMs;
+  // Codes start on vsync (as the player shows them): start k = round(k·Td / Tr)·Tr.
+  const starts = new Float64Array(codes + 1);
+  for (let k = 0; k <= codes; k++) starts[k] = Math.round((k * Td) / Tr) * Tr;
+  let worst = 1;
+  for (let i = 0; i < phases; i++) {
+    const phase = (i / phases) * Tc;
+    let ok = 0;
+    for (let k = 0; k < codes; k++) {
+      // First camera frame that starts after the code has been fully drawn.
+      const n = Math.ceil((starts[k] + ts - phase) / Tc - 1e-9);
+      if (phase + n * Tc + tau <= starts[k + 1] + 1e-9) ok++;
+    }
+    worst = Math.min(worst, ok / codes);
+  }
+  return worst;
+}
+
 /** Camera pixels per module needed for reliable detection (Nyquist ×2 plus margin for blur/perspective). */
 export const MIN_PIXELS_PER_MODULE = 3;
 

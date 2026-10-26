@@ -63,6 +63,12 @@ export function buildFrame(header: FrameHeader, fill: (payload: Uint8Array) => v
   return out;
 }
 
+/** Symbol id of a frame without parsing the payload; null for anything that is not ours. */
+export function peekSymbolId(bytes: Uint8Array): number | null {
+  if (bytes.length <= HEADER_SIZE || bytes[0] !== FRAME_MAGIC) return null;
+  return new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getUint32(11, true);
+}
+
 /** Parses and de-whitens a frame; returns null for anything that is not ours. */
 export function parseFrame(bytes: Uint8Array): Frame | null {
   if (bytes.length <= HEADER_SIZE || bytes[0] !== FRAME_MAGIC) return null;
