@@ -4,7 +4,7 @@ import type { IngestKind, ReceiverStatus } from '../core/transfer';
 // ---- sender: main ⇄ encode worker -------------------------------------------
 
 export type EncodeRequest =
-  | { type: 'init'; epoch: number; stream: Uint8Array; version: number; ecc: Ecc; transferId: number }
+  | { type: 'init'; epoch: number; stream: Uint8Array; version: number; ecc: Ecc }
   | { type: 'frames'; epoch: number; firstId: number; count: number };
 
 export interface RenderedFrame {
@@ -15,7 +15,8 @@ export interface RenderedFrame {
 }
 
 export type EncodeResponse =
-  | { type: 'ready'; epoch: number; K: number; G: number; blockSize: number; size: number }
+  /** `transferId` is derived from the content (transferIdFor), so restarts reuse it. */
+  | { type: 'ready'; epoch: number; K: number; G: number; blockSize: number; size: number; transferId: number }
   | { type: 'frames'; epoch: number; frames: RenderedFrame[]; ms: number }
   | { type: 'error'; epoch: number; message: string };
 
@@ -43,8 +44,17 @@ export type DecodeResponse =
 
 // ---- receiver: main ⇄ fountain (receiver) worker -------------------------------
 
-export type ReceiverRequest = { type: 'codes'; codes: Uint8Array[]; now: number } | { type: 'reset' };
+export type ReceiverRequest =
+  | { type: 'codes'; codes: Uint8Array[]; now: number }
+  /** Rebuilds the most recent unfinished transfer from storage; sent once, right after start. */
+  | { type: 'restore'; now: number }
+  /** "Принять ещё": stored frames are deleted only if the current transfer is complete. */
+  | { type: 'reset' }
+  /** "Начать заново": deletes a stored transfer and drops it if it is the current one. */
+  | { type: 'discard'; transferId: number };
 
 export type ReceiverResponse =
   | { type: 'status'; status: ReceiverStatus | null; framesAccepted: number; lastKind: IngestKind | null; started: boolean }
+  /** An interrupted transfer was rebuilt from storage; reception continues once codes arrive. */
+  | { type: 'restored'; status: ReceiverStatus; framesAccepted: number }
   | { type: 'complete'; status: ReceiverStatus; stream: Uint8Array };

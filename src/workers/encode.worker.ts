@@ -33,8 +33,8 @@ self.onmessage = (e: MessageEvent<EncodeRequest>) => {
   try {
     if (msg.type === 'init') {
       epoch = msg.epoch;
-      encoder = new TransferEncoder(msg.stream, { version: msg.version, ecc: msg.ecc }, msg.transferId);
-      post({ type: 'ready', epoch, K: encoder.K, G: new Layout(encoder.K).G, blockSize: encoder.blockSize, size: encoder.qr.size });
+      encoder = new TransferEncoder(msg.stream, { version: msg.version, ecc: msg.ecc });
+      post({ type: 'ready', epoch, K: encoder.K, G: new Layout(encoder.K).G, blockSize: encoder.blockSize, size: encoder.qr.size, transferId: encoder.transferId });
     } else if (msg.type === 'frames') {
       if (msg.epoch !== epoch || !encoder) return;
       const t0 = performance.now();

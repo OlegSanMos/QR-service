@@ -131,6 +131,12 @@ export function renderReceive(root: HTMLElement): () => void {
   const stats = h('div', { class: 'stats' });
   const result = h('div');
   const errorBox = h('div');
+  const resumeNote = h(
+    'div',
+    { class: 'note', style: 'margin-top:10px;display:none' },
+    h('div', null, 'Продолжаем прерванный приём — включите камеру'),
+    h('button', { style: 'margin-top:8px', onclick: () => discardRestored() }, 'Начать заново'),
+  );
 
   const cameraField = h('label', { class: 'field', style: 'display:none' }, h('span', null, 'Камера'), cameraSelect);
   const settingsCard = h(
@@ -150,7 +156,7 @@ export function renderReceive(root: HTMLElement): () => void {
     viewfinder,
     cameraBtn,
     errorBox,
-    h('div', { class: 'card', style: 'margin-top:12px' }, fileLabel, h('div', { class: 'progress' }, progressBar), progressLabel, h('div', { style: 'margin-top:10px' }, stats)),
+    h('div', { class: 'card', style: 'margin-top:12px' }, fileLabel, h('div', { class: 'progress' }, progressBar), progressLabel, resumeNote, h('div', { style: 'margin-top:10px' }, stats)),
     result,
     settingsCard,
   );
@@ -191,6 +197,8 @@ export function renderReceive(root: HTMLElement): () => void {
   let lastCropPixels = 0;
 
   const post = (msg: ReceiverRequest): void => receiver.postMessage(msg);
+  // Picks up a transfer interrupted by a reload or crash (answered with 'restored').
+  post({ type: 'restore', now: performance.now() });
 
   pool.onError = (m) => showError(m);
   pool.onResult = (codes, qs, crop, ms) => {
@@ -237,14 +245,49 @@ export function renderReceive(root: HTMLElement): () => void {
         lastRank = 0;
         completeShown = false;
         clear(result);
+        hideRestored();
       }
       framesAccepted = msg.framesAccepted;
       updateStatus(msg.status, now);
+    } else if (msg.type === 'restored') {
+      framesAccepted = msg.framesAccepted;
+      lastRank = msg.status.rank; // restored blocks must not count as reception speed
+      updateStatus(msg.status, now);
+      showRestored(msg.status);
     } else {
+      hideRestored();
       updateStatus(msg.status, now);
       void finish(msg.status, msg.stream);
     }
   };
+
+  // ---- resuming an interrupted transfer ------------------------------------------
+  let restoredId: number | null = null;
+
+  function showRestored(s: ReceiverStatus): void {
+    restoredId = s.transferId;
+    resumeNote.style.display = '';
+  }
+
+  function hideRestored(): void {
+    restoredId = null;
+    resumeNote.style.display = 'none';
+  }
+
+  /** "Начать заново": forgets the restored transfer instead of continuing it. */
+  function discardRestored(): void {
+    if (restoredId !== null) post({ type: 'discard', transferId: restoredId });
+    hideRestored();
+    status = null;
+    lastRank = 0;
+    framesAccepted = 0;
+    progressBar.style.width = '0';
+    progressLabel.textContent = 'Ожидание кодов…';
+    fileLabel.textContent = '';
+  }
+
+  // Once the camera is being switched on, the "turn the camera on" note is done.
+  cameraBtn.addEventListener('click', hideRestored);
 
   function updateStatus(s: ReceiverStatus | null, now: number): void {
     status = s;

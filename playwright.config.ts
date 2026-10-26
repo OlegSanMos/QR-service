@@ -4,6 +4,8 @@ import { FAKE_CAMERA_VIDEO } from './e2e/paths';
 export default defineConfig({
   testDir: 'e2e',
   timeout: 90_000,
+  // The camera tests measure frame rates: keep browsers from competing for the CPU.
+  workers: 1,
   globalSetup: './e2e/global-setup.ts',
   reporter: [['list']],
   webServer: {

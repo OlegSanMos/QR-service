@@ -5,3 +5,7 @@ export const CACHE_DIR = fileURLToPath(new URL('./.cache/', import.meta.url));
 export const FAKE_CAMERA_VIDEO = `${CACHE_DIR}qr-stream.y4m`;
 /** The file encoded into that clip. */
 export const FAKE_CAMERA_SOURCE = `${CACHE_DIR}source.txt`;
+/** Small, slow clip (8 codes/s) for the resume tests: long enough to reload mid-transfer. */
+export const RESUME_CAMERA_VIDEO = `${CACHE_DIR}resume-stream.y4m`;
+/** The file encoded into that clip. */
+export const RESUME_CAMERA_SOURCE = `${CACHE_DIR}resume.txt`;

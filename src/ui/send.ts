@@ -2,7 +2,8 @@ import { packContainer } from '../core/container';
 import { blockCount } from '../core/fountain/layout';
 import { DEFAULT_CHANNEL, estimateThroughput } from '../core/limits';
 import { MAX_VERSION, type Ecc } from '../core/qr/tables';
-import { blockSizeFor, randomTransferId } from '../core/transfer';
+import { saveSendPosition, sendStartId } from '../core/resume-store';
+import { blockSizeFor } from '../core/transfer';
 import type { EncodeRequest, EncodeResponse, RenderedFrame } from '../workers/messages';
 import { ScreenWakeLock, clear, formatBytes, formatDuration, formatRate, h } from './dom';
 
@@ -42,6 +43,14 @@ function saveSettings(s: SendSettings): void {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(s));
   } catch {
     // ignore
+  }
+}
+
+function storageOrNull(): Storage | null {
+  try {
+    return localStorage;
+  } catch {
+    return null; // access itself throws where storage is disabled
   }
 }
 
@@ -231,6 +240,8 @@ export function renderSend(root: HTMLElement): () => void {
 // ---------------------------------------------------------------------------
 
 const QUEUE_TARGET = 6;
+/** How often the last shown symbol id is saved for resuming (also saved on stop). */
+const POSITION_SAVE_MS = 1000;
 
 class Player {
   private readonly worker: Worker;
@@ -245,6 +256,9 @@ class Player {
   private readonly srcCtx = this.src.getContext('2d')!;
   private queue: RenderedFrame[] = [];
   private nextId = 0;
+  private transferId = 0;
+  private lastShownId = -1;
+  private positionSavedAt = 0;
   private inflight = false;
   private epoch = 0;
   private K = 0;
@@ -306,13 +320,13 @@ class Player {
       stream: this.stream,
       version: this.settings.version,
       ecc: this.settings.ecc,
-      transferId: randomTransferId(),
     });
     this.updateFpsLabel();
     this.raf = requestAnimationFrame(this.tick);
   }
 
   destroy(): void {
+    this.savePosition();
     cancelAnimationFrame(this.raf);
     this.worker.terminate();
     window.removeEventListener('resize', this.onResize);
@@ -333,6 +347,9 @@ class Player {
       this.G = msg.G;
       this.blockSize = msg.blockSize;
       this.qrSize = msg.size;
+      // Same file and settings as before ⇒ same id: continue after the last symbol shown.
+      this.transferId = msg.transferId;
+      this.nextId = sendStartId(storageOrNull(), msg.transferId);
       this.layout();
       this.requestFrames();
     } else if (msg.type === 'frames') {
@@ -404,8 +421,16 @@ class Player {
     this.switches.push(now);
     while (this.switches.length && now - this.switches[0] > 1000) this.switches.shift();
     this.requestFrames();
-    this.updateInfo(frames[n - 1].symbolId);
+    this.lastShownId = frames[n - 1].symbolId;
+    this.updateInfo(this.lastShownId);
+    if (now - this.positionSavedAt >= POSITION_SAVE_MS) this.savePosition(now);
   };
+
+  private savePosition(now = performance.now()): void {
+    if (this.lastShownId < 0) return;
+    this.positionSavedAt = now;
+    saveSendPosition(storageOrNull(), this.transferId, this.lastShownId);
+  }
 
   private draw(canvas: HTMLCanvasElement, frame: RenderedFrame): void {
     if (this.src.width !== frame.width) this.src.width = this.src.height = frame.width;
