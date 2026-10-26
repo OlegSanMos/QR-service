@@ -13,7 +13,7 @@ describe('CodeTracker', () => {
     t.update([code(100, 200), code(1000, 210)], null);
     expect(t.all.length).toBe(2);
     expect(t.all[0].rect.x).toBeLessThan(t.all[1].rect.x);
-    expect(t.all[0].scale).toBeCloseTo(0.7, 5); // 5 px/module → 3.5
+    expect(t.all[0].scale).toBeCloseTo(0.75, 5); // 5 px/module → 3.5 needs 0.7, rounded up to 1/16 steps
   });
 
   it('follows a moving code instead of adding a track', () => {
@@ -40,6 +40,7 @@ describe('CodeTracker', () => {
     t.update([code(100, 100, 25, 7)], null);
     const id = t.all[0].id;
     expect(t.all[0].scale).toBeCloseTo(0.5, 5);
+    expect(t.all[0].ppm).toBeCloseTo(7, 5);
     t.update([], id);
     expect(t.all[0].scale).toBeCloseTo(0.75, 5);
     t.update([], null); // a probe that sees nothing does not count against tracks
@@ -68,5 +69,17 @@ describe('CodeTracker', () => {
     const b = t.bounds()!;
     expect(b.x).toBeCloseTo(100, 0);
     expect(b.w).toBeCloseTo(900 + 117 * 5, 0);
+  });
+});
+
+describe('CodeTracker stability', () => {
+  it('keeps a track rectangle and scale steady under corner jitter', () => {
+    const t = new CodeTracker(1920, 1080);
+    t.update([code(400, 300)], null);
+    const first = { ...t.all[0].rect };
+    const scale = t.all[0].scale;
+    for (let i = 0; i < 20; i++) t.update([code(400 + (i % 3) - 1, 300 + (i % 2))], t.all[0].id);
+    expect(t.all[0].rect).toEqual(first);
+    expect(t.all[0].scale).toBe(scale);
   });
 });

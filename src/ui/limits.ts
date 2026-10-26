@@ -207,7 +207,7 @@ export function renderLimits(root: HTMLElement): () => void {
         msSum += ms;
         if (codes.length) ok++;
       };
-      const crop = { x: 0, y: 0, w: camW, h: camH, scale: 1, tracked: false };
+      const crop = { x: 0, y: 0, w: camW, h: camH, scale: 1, trackId: null };
       const benchStart = performance.now();
       while (performance.now() - benchStart < 3000) {
         if (destroyed) return;

@@ -4,7 +4,7 @@
 // big region covering all of them, which is both slower and makes ZXing group
 // finder patterns of neighbouring codes. Full-frame probes discover new codes.
 
-import { downscaleFor, roiAround, type LocatedCode, type Rect } from './roi';
+import { downscaleFor, holdRoi, holdScale, pixelsPerModule, roiAround, type LocatedCode, type Rect } from './roi';
 
 export interface Track {
   readonly id: number;
@@ -19,10 +19,18 @@ export interface Track {
   side: number;
   /** Order in which tracks were last handed out (round-robin fairness). */
   lastJob: number;
+  /** Camera pixels per module of this code (for framing hints). */
+  ppm: number;
 }
 
 export const MAX_TRACKS = 4;
 const MISSES_TO_DROP = 4;
+/**
+ * Margin around a tracked code, in code sides. Enough for hand shake between
+ * frames at 30-60 fps, small enough to keep the neighbouring code's finder
+ * patterns out (they would make ZXing try wrong combinations).
+ */
+const TRACK_MARGIN = 0.2;
 
 function geometry(code: LocatedCode): { cx: number; cy: number; side: number } {
   const p = code.points;
@@ -48,8 +56,8 @@ export class CodeTracker {
   private jobCounter = 0;
 
   constructor(
-    private frameW: number,
-    private frameH: number,
+    public frameW: number,
+    public frameH: number,
   ) {}
 
   get all(): readonly Track[] {
@@ -89,7 +97,7 @@ export class CodeTracker {
     }
     for (const code of found) {
       const g = geometry(code);
-      const rect = roiAround([code], this.frameW, this.frameH);
+      const rect = roiAround([code], this.frameW, this.frameH, TRACK_MARGIN);
       if (!rect || !Number.isFinite(g.side) || g.side <= 0) continue;
       // The same code: the region it was decoded from, or a track whose centre is close.
       let track = source && found.length === 1 ? source : undefined;
@@ -105,11 +113,14 @@ export class CodeTracker {
       }
       if (!track) {
         if (this.tracks.length >= MAX_TRACKS) continue;
-        track = { id: this.nextId++, rect, scale: 1, misses: 0, cx: g.cx, cy: g.cy, side: g.side, lastJob: 0 };
+        track = { id: this.nextId++, rect: holdRoi(null, rect, this.frameW, this.frameH), scale: holdScale(1, downscaleFor([code])), misses: 0, cx: g.cx, cy: g.cy, side: g.side, lastJob: 0, ppm: 0 };
         this.tracks.push(track);
+      } else {
+        // Stable size and scale while the code stays inside: see holdRoi/holdScale.
+        track.rect = holdRoi(track.rect, rect, this.frameW, this.frameH);
+        track.scale = holdScale(track.scale, downscaleFor([code]));
       }
-      track.rect = rect;
-      track.scale = downscaleFor([code]);
+      track.ppm = pixelsPerModule(code) ?? track.ppm;
       track.misses = 0;
       track.cx = g.cx;
       track.cy = g.cy;

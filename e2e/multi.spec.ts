@@ -20,8 +20,8 @@ test('receiver reads two codes per frame and assembles the file', async ({ page 
   test.info().annotations.push({ type: 'speed', description: `${unique} codes in ${seconds.toFixed(1)} s = ${rate.toFixed(1)}/s` });
   console.log(`two-code clip: ${unique} distinct codes in ${seconds.toFixed(1)} s = ${rate.toFixed(1)} codes/s (total ${((Date.now() - started) / 1000).toFixed(1)} s)`);
   // The clip delivers ~51 distinct codes/s (2 codes × 30 changes/s, every 7th missing).
-  // A speed threshold is asserted once per-code tracking lands.
-  expect(rate).toBeGreaterThan(0);
+  // One shared region for both codes managed ~31.5/s; per-code tracking reaches 40-53/s.
+  expect(rate).toBeGreaterThan(36);
   const [download] = await Promise.all([page.waitForEvent('download'), page.getByRole('link', { name: /Сохранить/ }).click()]);
   expect(readFileSync(await download.path()).equals(readFileSync(MULTI_CAMERA_SOURCE))).toBe(true);
 });

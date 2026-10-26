@@ -2,7 +2,8 @@ import { describeFiles, type FileEntry, type Method } from '../core/container';
 import { createZip } from '../core/zip';
 import { unpackInWorker } from './codec';
 import { peekSymbolId } from '../core/protocol';
-import { downscaleFor, holdRoi, holdScale, roiAround, type LocatedCode, type Rect } from '../core/roi';
+import type { Rect } from '../core/roi';
+import { CodeTracker, MAX_TRACKS } from '../core/tracks';
 import type { ReceiverStatus } from '../core/transfer';
 import type { DecodeRequest, DecodeResponse, DetectedQuad, ReceiverRequest, ReceiverResponse } from '../workers/messages';
 import { ScreenWakeLock, clear, formatBytes, formatDuration, formatRate, h } from './dom';
@@ -10,8 +11,8 @@ import { ScreenWakeLock, clear, formatBytes, formatDuration, formatRate, h } fro
 /** Part of the camera frame sent to the decoder, and the factor it was resized by. */
 interface Crop extends Rect {
   scale: number;
-  /** True when this is the tracked region around the last seen codes. */
-  tracked: boolean;
+  /** Track this region follows (see core/tracks.ts), or null for a search of the whole frame. */
+  trackId: number | null;
 }
 
 /** Round-robin pool of ZXing workers; a frame is dropped when every worker is busy. */
@@ -61,6 +62,10 @@ export class DecoderPool {
     return this.workers.some((w) => w.ready && !w.busy);
   }
 
+  get idleCount(): number {
+    return this.workers.filter((w) => w.ready && !w.busy).length;
+  }
+
   submit(image: ImageData, maxSymbols: number, crop: Crop): boolean {
     const slot = this.workers.find((w) => w.ready && !w.busy);
     if (!slot) return false;
@@ -79,13 +84,13 @@ export class DecoderPool {
 }
 
 /** Upper bound for decoding threads (each holds its own ~1 MB WebAssembly instance). */
-export const MAX_POOL_SIZE = 4;
+export const MAX_POOL_SIZE = 6;
 
 export function defaultPoolSize(): number {
   // At least two: some browsers under-report cores for privacy, and one thread
   // at ~30 ms per frame would cap recognition at ~30 fps.
   const cores = navigator.hardwareConcurrency || 4;
-  return Math.max(2, Math.min(MAX_POOL_SIZE, cores - 1));
+  return Math.max(2, Math.min(4, cores - 1));
 }
 
 /** Sliding-window event rate. */
@@ -168,12 +173,6 @@ export function renderReceive(root: HTMLElement): () => void {
   const pool = new DecoderPool(defaultPoolSize());
   const receiver = new Worker(new URL('../workers/receiver.worker.ts', import.meta.url), { type: 'module' });
   const wakeLock = new ScreenWakeLock();
-  // Tracked regions and full-frame searches get a canvas each, so the periodic
-  // probes do not resize the tracking canvas back and forth (see holdRoi).
-  const captures = [0, 1].map(() => {
-    const canvas = document.createElement('canvas');
-    return { canvas, ctx: canvas.getContext('2d', { willReadFrequently: true })! };
-  });
   let stream: MediaStream | null = null;
   let running = false;
   let destroyed = false;
@@ -181,7 +180,6 @@ export function renderReceive(root: HTMLElement): () => void {
   let framesAccepted = 0;
   let lastForeignAt = 0;
   let quads: { q: DetectedQuad; at: number }[] = [];
-  let recentMax: number[] = [];
   /** [time, symbol id] of recently decoded codes, to measure how fast the sender changes codes. */
   let idTrail: [number, number][] = [];
   let frameCounter = 0;
@@ -195,10 +193,13 @@ export function renderReceive(root: HTMLElement): () => void {
   let lastMediaTime = -1;
   let lastPresented = -1;
   let completeShown = false;
-  // Region-of-interest tracking (see core/roi.ts).
-  let roi: Rect | null = null;
-  let roiScale = 1;
-  let roiMisses = 0;
+  // One tracked region per visible code (see core/tracks.ts).
+  const tracker = new CodeTracker(1, 1);
+  /** A capture canvas per track (fixed size while the track holds), plus one for whole-frame searches. */
+  const canvases = new Map<number | null, { canvas: HTMLCanvasElement; ctx: CanvasRenderingContext2D }>();
+  /** Track jobs that could not be served because every decoder was busy (drives pool growth). */
+  let starved = 0;
+  let starvedAtCheck = 0;
   let lastGrowCheck = 0;
   let droppedAtCheck = 0;
   let cameraFramesAtCheck = 0;
@@ -220,9 +221,7 @@ export function renderReceive(root: HTMLElement): () => void {
       points: q.points.map((v, i) => (i % 2 === 0 ? crop.x : crop.y) + v / crop.scale),
     }));
     for (const q of located) quads.push({ q, at: now });
-    updateRoi(located.filter((q) => q.valid), crop);
-    recentMax.push(codes.length);
-    if (recentMax.length > 30) recentMax.shift();
+    tracker.update(located.filter((q) => q.valid), crop.trackId);
     if (codes.length) {
       codeRate.add(now, codes.length);
       for (const c of codes) {
@@ -233,25 +232,6 @@ export function renderReceive(root: HTMLElement): () => void {
       if (running) post({ type: 'codes', codes, now });
     }
   };
-
-  /** Follows the codes: crop around them next time, or fall back to the whole frame after misses. */
-  function updateRoi(found: LocatedCode[], crop: Crop): void {
-    const vw = video.videoWidth;
-    const vh = video.videoHeight;
-    if (found.length > 0) {
-      // Keep the region and its scale while the code stays inside: a capture size that
-      // changes every frame reallocates the canvas and the ImageData each time.
-      const next = roiAround(found, vw, vh);
-      roi = next && holdRoi(roi, next, vw, vh);
-      roiScale = holdScale(roiScale, downscaleFor(found));
-      roiMisses = 0;
-    } else if (roi && crop.tracked) {
-      // A miss inside the ROI: maybe too blurry for the downscale — use more pixels,
-      // and after a few misses search the whole frame again.
-      roiScale = Math.min(1, roiScale * 1.5);
-      if (++roiMisses >= 4) roi = null;
-    }
-  }
 
   receiver.onmessage = (e: MessageEvent<ReceiverResponse>) => {
     const msg = e.data;
@@ -364,8 +344,7 @@ export function renderReceive(root: HTMLElement): () => void {
     await tuneTrack(track);
     await listCameras(track.getSettings().deviceId);
     describeCamera(track);
-    roi = null;
-    roiScale = 1;
+    tracker.reset(video.videoWidth || 1, video.videoHeight || 1);
     lastPresented = -1;
     scheduleFrame();
   }
@@ -457,39 +436,60 @@ export function renderReceive(root: HTMLElement): () => void {
       cameraRate.add(now);
       cameraFrames++;
     }
-    if (!pool.hasIdle()) {
+    if (tracker.frameW !== vw || tracker.frameH !== vh) tracker.reset(vw, vh);
+    let idle = pool.idleCount;
+    if (idle === 0) {
       dropped++;
+      starved += tracker.all.length;
       return;
     }
     frameCounter++;
-    // Every 15th frame scans the whole frame and looks for up to 4 codes, so newly
-    // appeared codes are found even while tracking; otherwise only the tracked area.
-    const probe = frameCounter % 15 === 0;
-    let crop: Crop;
-    if (roi && !probe) {
-      crop = { ...roi, scale: roiScale, tracked: true };
-    } else if (!roi && cropSelect.value === 'center') {
-      const side = Math.min(vw, vh);
-      crop = { x: (vw - side) / 2, y: (vh - side) / 2, w: side, h: side, scale: 1, tracked: false };
-    } else {
-      // Probes reuse the known module size; a blind search keeps full resolution.
-      crop = { x: 0, y: 0, w: vw, h: vh, scale: roi ? roiScale : 1, tracked: false };
+    // Every 15th frame (and whenever nothing is tracked) one decoder searches the
+    // whole frame for up to MAX_TRACKS codes, so newly visible codes get tracks;
+    // the other decoders each read one tracked code, least recently served first.
+    const tracks = tracker.all;
+    if (tracks.length === 0 || frameCounter % 15 === 0) {
+      let crop: Crop;
+      if (tracks.length === 0 && cropSelect.value === 'center') {
+        const side = Math.min(vw, vh);
+        crop = { x: (vw - side) / 2, y: (vh - side) / 2, w: side, h: side, scale: 1, trackId: null };
+      } else {
+        // With codes in view their module size is known: search at that resolution.
+        const scale = tracks.length ? Math.max(...tracks.map((t) => t.scale)) : 1;
+        crop = { x: 0, y: 0, w: vw, h: vh, scale, trackId: null };
+      }
+      submitCrop(crop, MAX_TRACKS);
+      idle--;
     }
+    const jobs = tracker.jobs(idle);
+    starved += Math.max(0, tracks.length - jobs.length);
+    for (const t of jobs) submitCrop({ ...t.rect, scale: t.scale, trackId: t.id }, 1);
+  }
+
+  function submitCrop(crop: Crop, maxSymbols: number): void {
     const dw = Math.max(1, Math.round(crop.w * crop.scale));
     const dh = Math.max(1, Math.round(crop.h * crop.scale));
-    const { canvas: capture, ctx: captureCtx } = captures[crop.tracked ? 0 : 1];
-    if (capture.width !== dw || capture.height !== dh) {
-      capture.width = dw;
-      capture.height = dh;
+    let slot = canvases.get(crop.trackId);
+    if (!slot) {
+      const canvas = document.createElement('canvas');
+      slot = { canvas, ctx: canvas.getContext('2d', { willReadFrequently: true })! };
+      canvases.set(crop.trackId, slot);
     }
-    captureCtx.imageSmoothingEnabled = true;
-    captureCtx.drawImage(video, crop.x, crop.y, crop.w, crop.h, 0, 0, dw, dh);
-    const image = captureCtx.getImageData(0, 0, dw, dh);
+    // Forget canvases of tracks that are gone.
+    if (canvases.size > MAX_TRACKS + 1) {
+      for (const id of canvases.keys()) if (id !== null && !tracker.all.some((t) => t.id === id)) canvases.delete(id);
+    }
+    const { canvas, ctx } = slot;
+    if (canvas.width !== dw || canvas.height !== dh) {
+      canvas.width = dw;
+      canvas.height = dh;
+    }
+    ctx.imageSmoothingEnabled = true;
+    ctx.drawImage(video, crop.x, crop.y, crop.w, crop.h, 0, 0, dw, dh);
+    const image = ctx.getImageData(0, 0, dw, dh);
     // Record the exact factor used after rounding, so coordinates map back precisely.
     crop.scale = dw / crop.w;
-    lastCropPixels = dw * dh;
-    const seen = Math.max(1, ...recentMax);
-    const maxSymbols = probe ? 4 : Math.min(4, seen);
+    if (crop.trackId !== null) lastCropPixels = dw * dh;
     pool.submit(image, maxSymbols, crop);
   }
 
@@ -525,11 +525,11 @@ export function renderReceive(root: HTMLElement): () => void {
     const scale = Math.min(w / vw, hh / vh);
     const ox = (w - vw * scale) / 2;
     const oy = (hh - vh * scale) / 2;
-    if (running && roi) {
+    if (running && tracker.all.length > 0) {
       ctx.strokeStyle = 'rgba(79,140,255,0.6)';
       ctx.lineWidth = 2 * dpr;
       ctx.setLineDash([8 * dpr, 6 * dpr]);
-      ctx.strokeRect(roi.x * scale + ox, roi.y * scale + oy, roi.w * scale, roi.h * scale);
+      for (const t of tracker.all) ctx.strokeRect(t.rect.x * scale + ox, t.rect.y * scale + oy, t.rect.w * scale, t.rect.h * scale);
       ctx.setLineDash([]);
     } else if (cropSelect.value === 'center' && running) {
       const side = Math.min(vw, vh) * scale;
@@ -573,7 +573,10 @@ export function renderReceive(root: HTMLElement): () => void {
     setStat('Распознаётся', `${decFps.toFixed(0)} к/с · ${decodeMs.toFixed(0)} мс · ${pool.size} пот.`);
     setStat('Кодов прочитано', `${codesPs.toFixed(1)}/с`);
     setStat('Пропущено кадров', String(dropped));
-    setStat('Область', running ? (roi ? `слежение · ${Math.round(Math.sqrt(lastCropPixels))}² пикс.` : 'весь кадр') : '—');
+    const nTracks = tracker.all.length;
+    setStat('Область', running ? (nTracks ? `слежение · ${nTracks} ${nTracks === 1 ? 'код' : 'кода'} · ${Math.round(Math.sqrt(lastCropPixels))}² пикс.` : 'весь кадр') : '—');
+    const framing = running ? framingHint() : '';
+    if (framing && !hint.textContent) hint.textContent = framing;
     const advice = running && camFps >= 45 ? senderRateHint(camFps, now) : '';
     if (advice) hint.textContent = advice;
     if (!status) return;
@@ -604,14 +607,35 @@ export function renderReceive(root: HTMLElement): () => void {
     if (!running || now - lastGrowCheck < 1500) return;
     const frames = cameraFrames - cameraFramesAtCheck;
     const lost = dropped - droppedAtCheck;
+    const missedJobs = starved - starvedAtCheck;
     lastGrowCheck = now;
     cameraFramesAtCheck = cameraFrames;
     droppedAtCheck = dropped;
-    if (frames >= 20 && lost / frames > 0.15 && pool.size < MAX_POOL_SIZE && pool.readyCount === pool.size) {
+    starvedAtCheck = starved;
+    // Several codes need a decoder each per camera frame; up to 4 threads for one code, 6 for more.
+    const limit = tracker.all.length > 1 ? MAX_POOL_SIZE : 4;
+    const jobsWanted = frames * Math.max(1, tracker.all.length);
+    const lossy = lost / Math.max(1, frames) > 0.15 || missedJobs / Math.max(1, jobsWanted) > 0.15;
+    if (frames >= 20 && lossy && pool.size < limit && pool.readyCount === pool.size) {
       pool.grow();
       const track = stream?.getVideoTracks()[0];
       if (track) describeCamera(track);
     }
+  }
+
+  /** Advice on framing: codes cut off by the frame edge, or too small to read reliably. */
+  function framingHint(): string {
+    const vw = video.videoWidth;
+    const vh = video.videoHeight;
+    const edge = Math.min(vw, vh) * 0.02;
+    for (const t of tracker.all) {
+      const half = t.side / 2;
+      if (t.cx - half < edge || t.cy - half < edge || t.cx + half > vw - edge || t.cy + half > vh - edge) {
+        return 'Код у края кадра — отодвиньте телефон, чтобы все коды целиком были в кадре';
+      }
+      if (t.ppm > 0 && t.ppm < 2.6) return 'Коды мелковаты — поднесите телефон ближе (на модуль нужно ≥ 3 пикселя камеры)';
+    }
+    return '';
   }
 
   /** Code changes per second on the sender, from the symbol ids decoded in the last seconds. */
@@ -625,7 +649,7 @@ export function renderReceive(root: HTMLElement): () => void {
     }
     if (!lo || !hi || hi[0] - lo[0] < 1000 || hi[1] - lo[1] > 100_000) return 0;
     // Ids are dealt to the codes on screen in turn: one change shows `codes` new ids.
-    const codesOnScreen = Math.max(1, ...recentMax);
+    const codesOnScreen = Math.max(1, tracker.all.length);
     return ((hi[1] - lo[1]) * 1000) / (hi[0] - lo[0]) / codesOnScreen;
   }
 
