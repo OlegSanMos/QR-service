@@ -7,6 +7,7 @@ import { mkdirSync, writeFileSync } from 'node:fs';
 import { packFiles } from '../src/core/container';
 import { TransferEncoder } from '../src/core/transfer';
 import { Prng } from '../src/core/prng';
+import { makeMultiCodeClip } from './multi-clip';
 import { CACHE_DIR, FAKE_CAMERA_SOURCE, FAKE_CAMERA_SOURCE_BIN, FAKE_CAMERA_SOURCE_CSV, FAKE_CAMERA_VIDEO } from './paths';
 
 const W = 960;
@@ -58,4 +59,5 @@ export default async function globalSetup(): Promise<void> {
     for (let rep = 0; rep < 2; rep++) chunks.push(Buffer.from('FRAME\n', 'ascii'), y, chroma);
   }
   writeFileSync(FAKE_CAMERA_VIDEO, Buffer.concat(chunks));
+  await makeMultiCodeClip();
 }

@@ -9,3 +9,6 @@ export const FAKE_CAMERA_SOURCE = `${CACHE_DIR}source.txt`;
 export const FAKE_CAMERA_SOURCE_CSV = `${CACHE_DIR}table.csv`;
 /** Incompressible third file of that archive (keeps the transfer a few seconds long). */
 export const FAKE_CAMERA_SOURCE_BIN = `${CACHE_DIR}random.bin`;
+/** Clip with two codes on screen at once, and the file it carries. */
+export const MULTI_CAMERA_VIDEO = `${CACHE_DIR}qr-multi.y4m`;
+export const MULTI_CAMERA_SOURCE = `${CACHE_DIR}multi.bin`;
