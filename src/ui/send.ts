@@ -476,11 +476,15 @@ class Player {
     const rows = n / cols;
     const dpr = window.devicePixelRatio || 1;
     const total = this.qrSize + 8;
+    // Several codes get 4 extra modules of white between them, so the receiver
+    // never pairs finder patterns of neighbouring codes and can track each one.
+    const gapModules = n > 1 ? 4 : 0;
     const cell = Math.min(box.width / cols, box.height / rows);
     // Integer device pixels per module keep every module the same width (no moiré).
-    const scale = Math.max(1, Math.floor((cell * dpr) / total));
+    const scale = Math.max(1, Math.floor((cell * dpr) / (total + gapModules)));
     const px = total * scale;
     this.codesBox.style.gridTemplateColumns = `repeat(${cols}, auto)`;
+    this.codesBox.style.gap = `${(gapModules * scale) / dpr}px`;
     if (this.canvases.length !== n) {
       clear(this.codesBox);
       this.canvases = Array.from({ length: n }, () => h('canvas'));
