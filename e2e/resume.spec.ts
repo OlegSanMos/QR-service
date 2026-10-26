@@ -14,6 +14,13 @@ async function blocks(page: Page): Promise<{ rank: number; K: number }> {
   return m ? { rank: Number(m[1]), K: Number(m[2]) } : { rank: 0, K: 0 };
 }
 
+/** The restored progress: the note appears at once, the label with the next animation frame. */
+async function restoredBlocks(page: Page): Promise<{ rank: number; K: number }> {
+  await expect(page.getByText(RESUME_NOTE)).toBeVisible();
+  await expect.poll(async () => (await blocks(page)).rank).toBeGreaterThan(0);
+  return blocks(page);
+}
+
 /** Starts receiving and reloads the page once part of the transfer has been stored. */
 async function receivePartlyAndReload(page: Page): Promise<{ seen: number; K: number }> {
   await page.goto('/#/receive');
@@ -31,10 +38,9 @@ test('reception interrupted by a reload resumes from the stored progress', async
   const { seen, K } = await receivePartlyAndReload(page);
 
   // The stored progress is back before the camera is switched on.
-  await expect(page.getByText(RESUME_NOTE)).toBeVisible();
+  const restored = await restoredBlocks(page);
   const cameraBtn = page.getByRole('button', { name: /Включить камеру/ });
   await expect(cameraBtn).toBeVisible();
-  const restored = await blocks(page);
   expect(restored.K).toBe(K);
   expect(restored.rank).toBeGreaterThanOrEqual(seen);
   expect(restored.rank).toBeLessThan(K);
@@ -55,8 +61,7 @@ test('reception interrupted by a reload resumes from the stored progress', async
 
 test('"Начать заново" discards an interrupted reception', async ({ page }) => {
   await receivePartlyAndReload(page);
-  await expect(page.getByText(RESUME_NOTE)).toBeVisible();
-  expect((await blocks(page)).rank).toBeGreaterThan(0);
+  await restoredBlocks(page);
 
   await page.getByRole('button', { name: 'Начать заново' }).click();
   await expect(page.getByText(RESUME_NOTE)).toBeHidden();
