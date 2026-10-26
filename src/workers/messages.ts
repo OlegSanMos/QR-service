@@ -58,3 +58,28 @@ export type ReceiverResponse =
   /** An interrupted transfer was rebuilt from storage; reception continues once codes arrive. */
   | { type: 'restored'; status: ReceiverStatus; framesAccepted: number }
   | { type: 'complete'; status: ReceiverStatus; stream: Uint8Array };
+
+// ---- both sides: main ⇄ codec worker (packing / unpacking archives) ------------
+
+export type CodecRequest =
+  | {
+      type: 'pack';
+      id: number;
+      files: { name: string; mime: string; data: Uint8Array }[];
+      method: 'auto' | 'store' | 'deflate' | 'cm';
+      linkBytesPerSecond: number;
+    }
+  | { type: 'unpack'; id: number; stream: Uint8Array };
+
+export type CodecResponse =
+  | { type: 'progress'; id: number; phase: 'store' | 'deflate' | 'cm'; done: number; total: number }
+  | {
+      type: 'packed';
+      id: number;
+      stream: Uint8Array;
+      method: 'store' | 'deflate' | 'cm';
+      totalSize: number;
+      candidates: { method: string; size: number; ms: number; cost: number; aborted?: boolean }[];
+    }
+  | { type: 'unpacked'; id: number; files: { name: string; mime: string; data: Uint8Array }[]; method: 'store' | 'deflate' | 'cm' }
+  | { type: 'error'; id: number; message: string };

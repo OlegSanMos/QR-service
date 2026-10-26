@@ -119,6 +119,9 @@ interface Candidate {
   seenAt: number;
 }
 
+/** How much of the stream start is examined for the archive header (file list). */
+const MAX_HEADER_PEEK = 256 * 1024;
+
 /** After this long without frames from the current transfer, a new one may take over. */
 const SWITCH_AFTER_MS = 2500;
 
@@ -190,7 +193,8 @@ export class TransferReceiver {
   private peekInfo(s: Session): ContainerInfo | null {
     const parts: Uint8Array[] = [];
     let len = 0;
-    for (let b = 0; b < s.decoder.K && len < 1300; b++) {
+    // The archive header lists every file, so it may span several blocks.
+    for (let b = 0; b < s.decoder.K && len < MAX_HEADER_PEEK; b++) {
       const block = s.decoder.getBlock(b);
       if (!block) break;
       parts.push(block);

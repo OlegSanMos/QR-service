@@ -1,4 +1,6 @@
-import { unpackContainer, type UnpackedContainer } from '../core/container';
+import { describeFiles, type FileEntry, type Method } from '../core/container';
+import { createZip } from '../core/zip';
+import { unpackInWorker } from './codec';
 import { downscaleFor, roiAround, type LocatedCode, type Rect } from '../core/roi';
 import type { ReceiverStatus } from '../core/transfer';
 import type { DecodeRequest, DecodeResponse, DetectedQuad, ReceiverRequest, ReceiverResponse } from '../workers/messages';
@@ -562,7 +564,9 @@ export function renderReceive(root: HTMLElement): () => void {
     const pct = (s.rank / s.K) * 100;
     progressBar.style.width = `${pct.toFixed(1)}%`;
     const info = s.info;
-    fileLabel.textContent = info ? `${info.name} · ${formatBytes(info.size)}${info.compressed ? ' (сжат)' : ''}` : `Передача ${s.transferId.toString(16)} · ${formatBytes(s.totalLength)}`;
+    fileLabel.textContent = info
+      ? `${describeFiles(info.files)} · ${formatBytes(info.totalSize)}${info.method !== 'store' ? ` (сжато до ${formatBytes(s.totalLength)})` : ''}`
+      : `Передача ${s.transferId.toString(16)} · ${formatBytes(s.totalLength)}`;
     const rate = rankRate.perSecond(now) * s.blockSize;
     const elapsed = ((s.completedAt ?? now) - s.startedAt) / 1000;
     const eta = rate > 0 ? ((s.K - s.rank) * s.blockSize) / rate : Infinity;
@@ -608,37 +612,70 @@ export function renderReceive(root: HTMLElement): () => void {
     placeholder.style.display = '';
     placeholder.textContent = 'Приём завершён';
     clear(result);
-    let file: UnpackedContainer;
+    const unpackNote = h('div', { class: 'card small' }, 'Распаковка…');
+    result.appendChild(unpackNote);
+    const t0 = performance.now();
+    let files: FileEntry[];
+    let method: Method;
     try {
-      file = await unpackContainer(data);
+      const r = await unpackInWorker(data, (p) => {
+        unpackNote.textContent = p.phase === 'cm' ? `Распаковка (контекстное смешивание): ${Math.round((p.done / Math.max(1, p.total)) * 100)}%` : 'Распаковка…';
+      });
+      files = r.files;
+      method = r.method;
     } catch (err) {
-      result.appendChild(h('div', { class: 'card note err' }, `Файл собран, но повреждён: ${err instanceof Error ? err.message : String(err)}`, h('div', { style: 'margin-top:8px' }, againButton())));
+      clear(result);
+      result.appendChild(h('div', { class: 'card note err' }, `Данные собраны, но повреждены: ${err instanceof Error ? err.message : String(err)}`, h('div', { style: 'margin-top:8px' }, againButton())));
       return;
     }
-    const seconds = Math.max(0.001, ((s.completedAt ?? performance.now()) - s.startedAt) / 1000);
-    const blob = new Blob([file.data as BlobPart], { type: file.mime });
-    const url = URL.createObjectURL(blob);
-    const saveLink = h('a', { class: 'button primary', href: url, download: file.name }, '💾 Сохранить');
-    const actions = h('div', { class: 'row', style: 'justify-content:center;margin-top:12px' }, saveLink);
-    const shareFile = new File([blob], file.name, { type: file.mime });
-    if (navigator.canShare?.({ files: [shareFile] })) {
-      actions.appendChild(h('button', { onclick: () => void navigator.share({ files: [shareFile] }).catch(() => {}) }, '↗ Поделиться'));
+    clear(result);
+    const unpackSecs = (performance.now() - t0) / 1000;
+    const seconds = Math.max(0.001, ((s.completedAt ?? performance.now()) - s.startedAt) / 1000 + unpackSecs);
+    const totalSize = files.reduce((sum, f) => sum + f.data.length, 0);
+    const blobs = files.map((f) => new Blob([f.data as BlobPart], { type: f.mime }));
+    const urls = blobs.map((b) => URL.createObjectURL(b));
+    const baseName = (name: string): string => name.split('/').pop() || name;
+    const actions = h('div', { class: 'row', style: 'justify-content:center;margin-top:12px' });
+
+    if (files.length === 1) {
+      actions.appendChild(h('a', { class: 'button primary', href: urls[0], download: baseName(files[0].name) }, '💾 Сохранить'));
+    } else {
+      const zipUrl = URL.createObjectURL(new Blob([createZip(files) as BlobPart], { type: 'application/zip' }));
+      actions.appendChild(h('a', { class: 'button primary', href: zipUrl, download: 'qr-air-files.zip' }, '🗜 Сохранить всё (.zip)'));
+    }
+    const shareFiles = files.map((f, i) => new File([blobs[i]], baseName(f.name), { type: f.mime }));
+    if (navigator.canShare?.({ files: shareFiles })) {
+      actions.appendChild(h('button', { onclick: () => void navigator.share({ files: shareFiles }).catch(() => {}) }, files.length > 1 ? '↗ Поделиться всеми' : '↗ Поделиться'));
     }
     actions.appendChild(againButton());
+
     const preview = h('div', { class: 'preview', style: 'margin-top:12px' });
-    if (file.mime.startsWith('image/')) preview.appendChild(h('img', { src: url, alt: file.name }));
-    else if (file.mime.startsWith('text/') || /\.(txt|md|json|csv|log|xml|html?)$/i.test(file.name)) {
-      const text = new TextDecoder().decode(file.data.subarray(0, 100_000));
-      preview.appendChild(h('pre', null, text));
-      actions.appendChild(h('button', { onclick: () => void navigator.clipboard?.writeText(text).catch(() => {}) }, '📋 Копировать'));
+    if (files.length === 1) {
+      const f = files[0];
+      if (f.mime.startsWith('image/')) preview.appendChild(h('img', { src: urls[0], alt: f.name }));
+      else if (f.mime.startsWith('text/') || /\.(txt|md|json|csv|log|xml|html?)$/i.test(f.name)) {
+        const text = new TextDecoder().decode(f.data.subarray(0, 100_000));
+        preview.appendChild(h('pre', null, text));
+        actions.appendChild(h('button', { onclick: () => void navigator.clipboard?.writeText(text).catch(() => {}) }, '📋 Копировать'));
+      }
+    } else {
+      const list = h('div', { class: 'file-list' });
+      files.forEach((f, i) =>
+        list.appendChild(
+          h('div', { class: 'row' }, h('span', { class: 'grow' }, `${f.name} — ${formatBytes(f.data.length)}`), h('a', { class: 'button', href: urls[i], download: baseName(f.name) }, '💾')),
+        ),
+      );
+      preview.appendChild(list);
     }
+
+    const compression = method === 'store' ? '' : ` · сжатие ${method === 'cm' ? 'CM' : 'deflate'}: передано ${formatBytes(s.totalLength)}`;
     result.appendChild(
       h(
         'div',
         { class: 'card done' },
         h('div', { class: 'big' }, '✅'),
-        h('h3', null, file.name),
-        h('div', { class: 'muted small' }, `${formatBytes(file.data.length)}${file.compressed ? ` (передано ${formatBytes(s.totalLength)} сжатыми)` : ''} · ${formatDuration(seconds)} · ${formatRate(s.totalLength / seconds)} · CRC-32 ✔`),
+        h('h3', null, describeFiles(files)),
+        h('div', { class: 'muted small' }, `${formatBytes(totalSize)} за ${formatDuration(seconds)} · ${formatRate(totalSize / seconds)}${compression} · CRC-32 ✔`),
         actions,
         preview,
       ),

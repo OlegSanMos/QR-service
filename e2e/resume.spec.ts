@@ -1,13 +1,9 @@
 import { expect, test, type Page } from '@playwright/test';
 import { readFileSync } from 'node:fs';
-import { RESUME_CAMERA_SOURCE, RESUME_CAMERA_VIDEO } from './paths';
+import { RESUME_CAMERA_SOURCE } from './paths';
 
-// A slow fake camera (8 codes/s, see global-setup.ts) so a reload lands mid-transfer.
-test.use({
-  launchOptions: {
-    args: ['--use-fake-ui-for-media-stream', '--use-fake-device-for-media-stream', `--use-file-for-fake-video-capture=${RESUME_CAMERA_VIDEO}`],
-  },
-});
+// Runs in the 'resume' project: a slow fake camera (8 codes/s, see resume-clip.ts)
+// so a reload lands mid-transfer.
 
 const RESUME_NOTE = 'Продолжаем прерванный приём';
 

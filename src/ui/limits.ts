@@ -11,6 +11,7 @@ import {
 import { HEADER_SIZE } from '../core/protocol';
 import { QrEncoder } from '../core/qr/encoder';
 import { byteCapacity, type Ecc } from '../core/qr/tables';
+import { cmCompress } from '../core/cm';
 import { STREAM_MASK, TransferEncoder } from '../core/transfer';
 import { clear, formatBytes, formatDuration, formatRate, h } from './dom';
 import { DecoderPool, defaultPoolSize } from './receive';
@@ -153,6 +154,21 @@ export function renderLimits(root: HTMLElement): () => void {
       }
       const autoFps = (m * 1000) / (performance.now() - t0);
       line(`Генерация кадров v${p.version}-${p.ecc}: ${encodeFps.toFixed(0)} кодов/с (фикс. маска ${STREAM_MASK} + отбеливание); со стандартным перебором 8 масок было бы ${autoFps.toFixed(0)} кодов/с.`);
+
+      // 1b. Compression speed: decides whether context mixing pays off on this device.
+      const sample = new TextEncoder().encode(
+        Array.from({ length: 6000 }, (_, i) => `${i};${['Москва', 'Казань', 'Омск'][i % 3]};${(i * 7919) % 10007};статус ${i % 7}\n`).join(''),
+      );
+      cmCompress(sample.subarray(0, 20_000)); // JIT warm-up
+      t0 = performance.now();
+      const cmPacked = cmCompress(sample);
+      const cmMs = performance.now() - t0;
+      const cmSpeed = sample.length / (cmMs / 1000);
+      line(
+        `Сжатие CM: ${formatRate(cmSpeed)} на этом устройстве (${formatBytes(sample.length)} таблицы → ${formatBytes(cmPacked.length)}). ` +
+          `На 1 МБ данных сжатие и распаковка займут ≈ ${((2.5 * 1048576) / cmSpeed).toFixed(1)} с — приложение выбирает CM, только если это меньше выигрыша во времени передачи.`,
+      );
+      await new Promise((r) => setTimeout(r, 0));
 
       // 2. Receiver side: ZXing on a camera-sized frame containing the code.
       pool?.destroy();
