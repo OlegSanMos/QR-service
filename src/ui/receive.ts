@@ -287,6 +287,20 @@ export function renderReceive(root: HTMLElement): () => void {
   // Once the camera is being switched on, the "turn the camera on" note is done.
   cameraBtn.addEventListener('click', hideRestored);
 
+  // Opening "Получить" means "receive now": if camera access was already granted,
+  // start right away instead of waiting for a tap.
+  void (async () => {
+    try {
+      const state = await navigator.permissions?.query({ name: 'camera' as PermissionName });
+      if (state?.state === 'granted' && !destroyed && !stream) {
+        hideRestored();
+        await startCamera();
+      }
+    } catch {
+      // Permissions API without "camera" (older Safari, Firefox): keep the button.
+    }
+  })();
+
   function updateStatus(s: ReceiverStatus | null, now: number): void {
     status = s;
     if (s && s.rank > lastRank) {

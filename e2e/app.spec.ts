@@ -102,3 +102,11 @@ test('auto mode shows two codes on a wide screen and one on a phone', async ({ p
     await page.getByRole('button', { name: /Стоп/ }).click();
   }
 });
+
+test('receiver starts the camera by itself once access was granted', async ({ page, context }) => {
+  await context.grantPermissions(['camera']);
+  await page.goto('/#/receive');
+  // No tap on "Включить камеру": the transfer completes on its own.
+  await expect(page.getByText('✅')).toBeVisible({ timeout: 60_000 });
+  await expect(page.getByRole('heading', { name: '3 файла' })).toBeVisible();
+});
