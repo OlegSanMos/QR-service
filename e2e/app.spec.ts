@@ -87,3 +87,18 @@ test('receiver decodes the fake camera stream and offers the file', async ({ pag
   expect(read('data/table.csv').equals(readFileSync(FAKE_CAMERA_SOURCE_CSV))).toBe(true);
   expect(read('data/random.bin').equals(readFileSync(FAKE_CAMERA_SOURCE_BIN))).toBe(true);
 });
+
+test('auto mode shows two codes on a wide screen and one on a phone', async ({ page }) => {
+  for (const [viewport, expected] of [
+    [{ width: 1280, height: 720 }, 2],
+    [{ width: 412, height: 915 }, 1],
+  ] as const) {
+    await page.setViewportSize(viewport);
+    await page.goto('/#/send');
+    await page.locator('input[type=file]').first().setInputFiles({ name: 'a.txt', mimeType: 'text/plain', buffer: Buffer.from('x'.repeat(5000)) });
+    await expect(page.getByRole('button', { name: /Авто/ })).toHaveClass(/on/);
+    await page.getByRole('button', { name: /Начать передачу/ }).click();
+    await expect(page.locator('.stage canvas')).toHaveCount(expected);
+    await page.getByRole('button', { name: /Стоп/ }).click();
+  }
+});

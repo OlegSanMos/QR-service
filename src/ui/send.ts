@@ -25,7 +25,7 @@ interface SendSettings {
 const AUTO_VERSION = 25;
 
 const PRESETS: { id: string; label: string; hint: string; s?: Omit<SendSettings, 'preset' | 'method'> }[] = [
-  { id: 'auto', label: '⚡ Авто', hint: 'самый быстрый режим для любой камеры получателя — подстраивается под экран' },
+  { id: 'auto', label: '⚡ Авто', hint: 'самый быстрый режим для любой камеры получателя: подстраивается под экран, на широком экране показывает 2 кода' },
   { id: 'reliable', label: 'Надёжно', hint: 'старые телефоны, плохой свет', s: { version: 14, ecc: 'M', fps: 7.5, codes: 1 } },
   { id: 'cam30', label: '30 к/с', hint: 'камера получателя снимает 30 к/с', s: { version: 25, ecc: 'L', fps: 15, codes: 1 } },
   { id: 'cam60', label: '60 к/с', hint: 'камера получателя 60 к/с (по умолчанию на приёме)', s: { version: 25, ecc: 'L', fps: 20, codes: 1 } },
@@ -59,6 +59,18 @@ function storageOrNull(): Storage | null {
   } catch {
     return null; // access itself throws where storage is disabled
   }
+}
+
+/**
+ * Two codes side by side fit a landscape laptop/tablet screen: each is still
+ * large enough for a phone camera framing the whole screen (v25: ~254 modules
+ * across, ≥ 4 camera px per module at 720p). On phones and portrait screens one
+ * big code is faster to aim at.
+ */
+function wideScreen(): boolean {
+  const w = Math.max(window.screen?.width ?? 0, window.innerWidth);
+  const hgt = Math.max(window.screen?.height ?? 0, window.innerHeight);
+  return window.innerWidth >= 900 && window.innerWidth > window.innerHeight * 1.2 && w >= 1000 && hgt >= 600;
 }
 
 /** Measures the display refresh rate from requestAnimationFrame intervals. */
@@ -224,7 +236,7 @@ export function renderSend(root: HTMLElement): () => void {
     if (settings.preset !== 'auto') return;
     settings.version = AUTO_VERSION;
     settings.ecc = 'L';
-    settings.codes = 1;
+    settings.codes = wideScreen() ? 2 : 1;
     settings.fps = Math.round(autoDisplayFps(refreshHz) * 10) / 10;
   }
 
@@ -349,8 +361,16 @@ export function renderSend(root: HTMLElement): () => void {
     refreshHz = hz;
     syncControls();
   });
+  // Rotating a tablet or resizing the window changes what "Авто" picks.
+  const onResize = (): void => {
+    if (settings.preset === 'auto' && !player) syncControls();
+  };
+  window.addEventListener('resize', onResize);
 
-  return () => player?.destroy();
+  return () => {
+    window.removeEventListener('resize', onResize);
+    player?.destroy();
+  };
 }
 
 /**
