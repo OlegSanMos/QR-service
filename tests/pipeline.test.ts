@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { packContainer, unpackContainer } from '../src/core/container';
+import { packFiles, unpackContainer } from '../src/core/container';
 import { Prng } from '../src/core/prng';
 import { TransferEncoder, TransferReceiver } from '../src/core/transfer';
 import { photograph } from './helpers/camera';
@@ -9,7 +9,7 @@ describe('end-to-end: file → QR frames → camera → file', () => {
   it('transfers a file through simulated camera captures with frame loss', async () => {
     const rng = new Prng(42);
     const data = new Uint8Array(6000).map(() => rng.nextU32() & 0xff);
-    const packed = await packContainer({ name: 'photo.bin', mime: 'application/octet-stream', data });
+    const packed = await packFiles([{ name: 'photo.bin', mime: 'application/octet-stream', data }]);
     const sender = new TransferEncoder(packed.stream, { version: 12, ecc: 'M' });
     const receiver = new TransferReceiver();
 
@@ -38,9 +38,9 @@ describe('end-to-end: file → QR frames → camera → file', () => {
       }
     }
     const status = receiver.status!;
-    expect(status.info).toMatchObject({ name: 'photo.bin', size: data.length });
+    expect(status.info?.files).toEqual([{ name: 'photo.bin', mime: 'application/octet-stream', size: data.length }]);
     const file = await unpackContainer(receiver.stream());
-    expect(Array.from(file.data)).toEqual(Array.from(data));
+    expect(Array.from(file.files[0].data)).toEqual(Array.from(data));
     expect(decodedFrames).toBeGreaterThan(0);
   }, 60_000);
 

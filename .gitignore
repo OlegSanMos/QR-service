@@ -6,3 +6,4 @@ e2e/.cache/
 *.log
 .DS_Store
 __pycache__/
+.claude/worktrees/

@@ -1,9 +1,17 @@
 import { defineConfig } from '@playwright/test';
-import { FAKE_CAMERA_VIDEO } from './e2e/paths';
+import { FAKE_CAMERA_VIDEO, MULTI_CAMERA_VIDEO, RESUME_CAMERA_VIDEO } from './e2e/paths';
+
+const fakeCamera = (clip: string): string[] => [
+  '--use-fake-ui-for-media-stream',
+  '--use-fake-device-for-media-stream',
+  `--use-file-for-fake-video-capture=${clip}`,
+];
 
 export default defineConfig({
   testDir: 'e2e',
   timeout: 90_000,
+  // The camera tests measure frame rates: keep browsers from competing for the CPU.
+  workers: 1,
   globalSetup: './e2e/global-setup.ts',
   reporter: [['list']],
   webServer: {
@@ -16,12 +24,11 @@ export default defineConfig({
     baseURL: 'http://localhost:4173',
     browserName: 'chromium',
     acceptDownloads: true,
-    launchOptions: {
-      args: [
-        '--use-fake-ui-for-media-stream',
-        '--use-fake-device-for-media-stream',
-        `--use-file-for-fake-video-capture=${FAKE_CAMERA_VIDEO}`,
-      ],
-    },
   },
+  projects: [
+    { name: 'one-code', testIgnore: /(multi|resume)\.spec/, use: { launchOptions: { args: fakeCamera(FAKE_CAMERA_VIDEO) } } },
+    { name: 'two-codes', testMatch: /multi\.spec/, use: { launchOptions: { args: fakeCamera(MULTI_CAMERA_VIDEO) } } },
+    // A slow camera (8 codes/s) so a reload lands mid-transfer.
+    { name: 'resume', testMatch: /resume\.spec/, use: { launchOptions: { args: fakeCamera(RESUME_CAMERA_VIDEO) } } },
+  ],
 });

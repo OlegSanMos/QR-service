@@ -2,7 +2,7 @@
 //
 //   offset size field
 //   0      1    magic 0x51 ('Q'), identifies protocol v1
-//   1      4    transferId   random per transfer; lets the receiver ignore stale codes
+//   1      4    transferId   hash of the content (transferIdFor); tells transfers apart
 //   5      4    totalLength  length of the container stream (metadata + file)
 //   9      2    blockSize    payload bytes per symbol (constant within a transfer)
 //   11     4    symbolId     fountain symbol id (see fountain/layout.ts)

@@ -160,3 +160,55 @@ export const PROTOCOL_LIMITS = {
   maxStreamBytes: 0xffffffff,
   headerBytes: HEADER_SIZE,
 } as const;
+
+/**
+ * Receiver camera profiles the sender cannot tell apart (there is no back
+ * channel): browsers deliver 30 fps (slow rolling shutter) or 60 fps. The
+ * weights favour 60 fps, which current phones reach in the app's default mode.
+ */
+export const CAMERA_PROFILES: { weight: number; cameraFps: number; shutterMs: number }[] = [
+  { weight: 0.35, cameraFps: 30, shutterMs: 20 },
+  { weight: 0.65, cameraFps: 60, shutterMs: 10 },
+];
+
+/** Weighted geometric mean of distinct codes/s over the camera profiles. */
+export function robustCodesPerSecond(displayFps: number, refreshHz: number): number {
+  let logSum = 0;
+  for (const p of CAMERA_PROFILES) {
+    const n = uniqueCodesPerSecond({ ...DEFAULT_CHANNEL, refreshHz, displayFps, cameraFps: p.cameraFps, shutterMs: p.shutterMs, decodeFps: Infinity });
+    logSum += p.weight * Math.log(Math.max(n, 1e-6));
+  }
+  return Math.exp(logSum);
+}
+
+/** Display rate (refresh / n) that is fastest in practice for an unknown receiver camera. */
+export function autoDisplayFps(refreshHz: number): number {
+  let best = refreshHz;
+  let bestRate = -1;
+  for (let n = 1; n <= 16; n++) {
+    const fps = refreshHz / n;
+    const rate = robustCodesPerSecond(fps, refreshHz);
+    if (rate > bestRate + 1e-9) {
+      bestRate = rate;
+      best = fps;
+    }
+  }
+  return best;
+}
+
+/** Expected useful bytes/s averaged over the camera profiles (for compression decisions). */
+export function expectedLinkBytesPerSecond(version: number, ecc: Ecc, codes: number, displayFps: number, refreshHz: number): number {
+  let sum = 0;
+  for (const p of CAMERA_PROFILES) {
+    sum += p.weight * estimateThroughput(version, ecc, codes, { ...DEFAULT_CHANNEL, refreshHz, displayFps, cameraFps: p.cameraFps, shutterMs: p.shutterMs }).bytesPerSecond;
+  }
+  return Math.max(1000, sum);
+}
+
+/** Snaps a measured frame interval to a common panel refresh rate. */
+export function snapRefreshHz(measured: number): number {
+  const common = [24, 30, 48, 50, 60, 75, 90, 100, 120, 144, 165, 240];
+  let best = 60;
+  for (const hz of common) if (Math.abs(hz - measured) < Math.abs(best - measured)) best = hz;
+  return Math.abs(best - measured) / best < 0.12 ? best : Math.round(measured);
+}
